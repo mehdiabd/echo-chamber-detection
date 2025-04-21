@@ -1,0 +1,12 @@
+# Core graph and analysis tools
+networkx
+python-louvain==0.16  # Louvain community detection
+node2vec        # Node2Vec graph embedding
+
+# ML & clustering
+scikit-learn==1.3.0    # For k-means, PCA, evaluation
+
+# Visualization
+matplotlib==3.8.0
+
+elasticsearch
