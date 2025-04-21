@@ -13,3 +13,10 @@ __pycache__/
 
 # OS files
 .DS_Store
+
+# certificates
+*.pem
+ca.crt
+
+# results
+res 
