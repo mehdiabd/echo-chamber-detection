@@ -1,18 +1,35 @@
 """Module providing a function to normalize JSON data."""
 import json
+import ast
 
 
 def normalize_json(input_file):
-    """Function to normalize JSON data by converting Python None to JSON null, etc."""
+    """Normalize the JSON data in the file."""
+    valid_json_list = []
+    total_hits = None
+
     with open(input_file, 'r', encoding='utf-8') as file:
-        data = json.load(file)
+        for line in file:
+            line = line.strip()
+            # Extract "Total hits" line
+            if line.startswith("Total hits:"):
+                total_hits = line
+                continue
+            # Skip empty lines
+            if not line:
+                continue
+            try:
+                # Convert Python-style dict to JSON
+                python_dict = ast.literal_eval(line)
+                valid_json_list.append(python_dict)
+            except (ValueError, SyntaxError):
+                print(f"Skipping invalid line: {line}")
 
-    # Convert Python None to JSON null and False to JSON false
-    normalized_data = json.dumps(data, ensure_ascii=False).replace("None", "null") \
-        .replace("False", "false")
-
+    # Write the "Total hits" line and valid JSON array back to the file
     with open(input_file, 'w', encoding='utf-8') as file:
-        file.write(normalized_data)
+        if total_hits:
+            file.write(total_hits + "\n")  # Write the "Total hits" line
+        json.dump(valid_json_list, file, ensure_ascii=False, indent=4)
 
 
 if __name__ == "__main__":
