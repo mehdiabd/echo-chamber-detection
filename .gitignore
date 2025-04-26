@@ -19,4 +19,4 @@ __pycache__/
 ca.crt
 
 # results
-res 
+res.json 
