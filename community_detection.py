@@ -4,7 +4,8 @@ import json
 import networkx as nx
 import community as community_louvain
 import matplotlib.pyplot as plt
-from matplotlib import cm
+from matplotlib import colormaps
+from matplotlib.colors import ListedColormap
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
 from node2vec import Node2Vec
@@ -22,9 +23,7 @@ def detect_communities_louvain(g):
 
 
 # Plotting Function
-def draw_partitioned_graph(
-    g, partition, title="Louvain Community Detection", method="Classic"
-):
+def draw_partitioned_graph(g, partition, title="Louvain Community Detection", method="Classic"):
     """
     Visualize the graph with node colors based on community partition.
     Includes a legend indicating the community and detection method.
@@ -33,7 +32,7 @@ def draw_partitioned_graph(
     plt.gca().clear()  # Clear the current axes to avoid overlapping plots
 
     pos = nx.spring_layout(g, seed=42)
-    cmap = cm.get_cmap('Set3', max(partition.values()) + 1)
+    cmap = ListedColormap(colormaps["Set3"].colors[:max(partition.values()) + 1])  # Use ListedColormap to limit colors
 
     # Draw nodes with community colors
     nx.draw_networkx_nodes(g, pos, node_size=300,
@@ -45,8 +44,7 @@ def draw_partitioned_graph(
     # Add legend for communities
     unique_communities = set(partition.values())
     for community in unique_communities:
-        plt.scatter([], [], color=cmap(community), label=f"Community {community}\
-            ({method})")
+        plt.scatter([], [], color=cmap(community), label=f"Community {community} ({method})")
 
     plt.title(title)
     plt.legend(loc="best", title="Communities")
@@ -89,6 +87,9 @@ def build_user_graph(messages):
                 g[sender][replied]['weight'] += 1
             else:
                 g.add_edge(sender, replied, weight=1)
+    print(f"Graph has {g.number_of_nodes()} nodes and {g.number_of_edges()} edges.")
+    for edge in g.edges(data=True):
+        print(f"Edge: {edge}")
     return g
 
 
@@ -96,11 +97,20 @@ def get_node_embeddings(g, dimensions=64):
     """
     Generate Node2Vec embeddings for the graph.
     """
-    node2vec = Node2Vec(g, dimensions=dimensions, walk_length=20, num_walks=100,
-                        workers=2)
+    node2vec = Node2Vec(g, dimensions=dimensions, walk_length=20, num_walks=100, workers=2)
     model = node2vec.fit(window=10, min_count=1)
-    embeddings = [model.wv[str(node)] for node in g.nodes()]
-    return embeddings, list(g.nodes())
+
+    # Ensure embeddings are generated for all nodes
+    embeddings = []
+    nodes = list(g.nodes())
+    for node in nodes:
+        try:
+            embeddings.append(model.wv[str(node)])
+        except KeyError:
+            print(f"Warning: No embedding found for node {node}. Using a zero vector.")
+            embeddings.append([0] * dimensions)  # Use a zero vector for missing embeddings
+
+    return embeddings, nodes
 
 
 def run_kmeans(embeddings, n_clusters=4):
@@ -117,18 +127,32 @@ def visualize_embeddings(embeddings, labels, nodes, method="Hybrid"):
     Visualize the embeddings with PCA and clustering labels.
     Includes a legend indicating the community and detection method.
     """
-    # Ensure the function operates within the current figure context
-    plt.gca().clear()  # Clear the current axes to avoid overlapping plots
+    # Debugging: Check dimensions
+    print(f"Number of embeddings: {len(embeddings)}")
+    print(f"Number of nodes: {len(nodes)}")
+    print(f"Number of labels: {len(labels)}")
+
+    # Ensure embeddings and labels match
+    if len(embeddings) != len(nodes):
+        raise ValueError("Mismatch between number of embeddings and nodes.")
 
     reduced = PCA(n_components=2).fit_transform(embeddings)
-    cmap = cm.get_cmap('Set3', len(set(labels)))
+    cmap = ListedColormap(colormaps["Set3"].colors[:len(set(labels))])  # Use ListedColormap to limit colors
 
-    for label in set(labels):
+    # Normalize labels to fit within the colormap range
+    unique_labels = sorted(set(labels))
+    print(f"Unique labels: {unique_labels}")
+    label_to_color = {label: cmap(i / len(unique_labels)) for i, label
+                      in enumerate(unique_labels)}
+
+    print(f"Label-to-color mapping: {label_to_color}")
+
+    for label in unique_labels:
         idx = [i for i, l in enumerate(labels) if l == label]
         x = [reduced[i][0] for i in idx]
         y = [reduced[i][1] for i in idx]
         plt.scatter(x, y, label=f"Community {label} ({method})", s=100,
-                    color=cmap(label))
+                    color=label_to_color[label])  # Use normalized color mapping
 
     for i, node in enumerate(nodes):
         plt.text(reduced[i][0], reduced[i][1], str(node), fontsize=8)
@@ -168,12 +192,18 @@ def main_hybrid_example():
 
     # Load tweets dataset
     messages = load_tweets_dataset()
+    print(f"Loaded {len(messages)} messages.")
+    for msg in messages[:5]:  # Print the first 5 messages for inspection
+        print(f"Message: {msg}")
 
     # Build user interaction graph
     g = build_user_graph(messages)
+    print(f"Graph has {g.number_of_nodes()} nodes and {g.number_of_edges()} edges.")
 
     # Generate embeddings and run clustering
     embeddings, nodes = get_node_embeddings(g)
+    print(f"Generated {len(embeddings)} embeddings for {len(nodes)} nodes.")
+
     labels = run_kmeans(embeddings, n_clusters=2)
 
     # Visualize the results
