@@ -20,3 +20,6 @@ ca.crt
 
 # results
 res.json 
+
+# experimental notebooks
+*.ipynb

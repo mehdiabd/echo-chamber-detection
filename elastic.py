@@ -18,7 +18,7 @@ es = Elasticsearch(
 )
 
 result = es.search(index=INDEX, body={"query": {"match_all": {}},
-                                      "size": 10,
+                                      "size": 10000,
                                       "track_total_hits": True})
 
 # Write the result to res.json
