@@ -1,7 +1,9 @@
 """Module providing a flexible Elasticsearch query script."""
 import os
+import sys
 import subprocess
 from elasticsearch import Elasticsearch
+from elasticsearch.helpers import scan
 
 # Prompt the user to select the authentication type
 print("Select the Elasticsearch server (authentication type):")
@@ -30,6 +32,8 @@ if auth_type == "1":
 elif auth_type == "2":
     # Basic Authentication
     print("You selected Temp Elasticsearch server (Basic Authentication).")
+    cur_path = os.path.dirname(__file__)
+    CERTIFICATE = os.path.join(cur_path, "http_ca.crt")
     ELASTICSEARCH_URL = "https://192.168.59.26:9200/"
     USERNAME = "m.abdolahi"
     PASSWORD = "@bd0l@h12345"
@@ -38,26 +42,50 @@ elif auth_type == "2":
     # Create Elasticsearch client
     es = Elasticsearch(
         ELASTICSEARCH_URL,
-        http_auth=(USERNAME, PASSWORD),
+        basic_auth=(USERNAME, PASSWORD),
         verify_certs=True,
-        ssl_show_warn=False
+        ca_certs=CERTIFICATE,
+        ssl_show_warn=False,
+        ssl_assert_hostname=False
     )
 else:
     print("Invalid selection. Please run the script again and select 1 or 2.")
-    exit(1)
+    sys.exit(1)
 
-# Query Elasticsearch
-result = es.search(index=INDEX, body={"query": {"match_all": {}},
-                                      "size": 1000,
-                                      "track_total_hits": True})
+query_body = {
+    "query": {
+        "bool": {
+            "must": [
+                {
+                    "match": {
+                        "date": "2025-04-20"
+                    }
+                }
+            ]
+        }
+    },
+    "_source": [
+        "user.username",
+        "user.displayname",
+        "mentionedUsers",
+        "retweetedTweet",
+        "quotedTweet"
+    ]
+}
 
-# Write the result to res.json
+result = scan(
+    es,
+    index=INDEX,
+    query=query_body,
+    preserve_order=True
+)
+
+count = 0
 with open("res.json", "w", encoding="utf-8") as f:
-    f.write(f"Total hits: {result['hits']['total']['value']}\n")
-    for doc in result['hits']['hits']:
+    for doc in result:
         f.write(f"{doc['_source']}\n")
-
-print("Total hits:", result['hits']['total']['value'])
+        count += 1
+print("Total hits:", count)
 
 # Automatically call normalize_json.py
 cur_path = os.path.dirname(__file__)
