@@ -1,4 +1,5 @@
 """Community Detection on Sample Social Graph via NetworkX and community-louvain"""
+from collections import defaultdict
 import json
 import networkx as nx
 import community as community_louvain
@@ -9,7 +10,6 @@ from matplotlib.colors import ListedColormap
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
 from node2vec import Node2Vec
-from collections import defaultdict
 
 
 # Visualization for Embeddings (PCA + Clusters)
@@ -121,20 +121,12 @@ def build_user_graph(messages):
         if not sender or not target or sender == target:
             continue
 
-        # Assign interaction weights
-        weight = 0
-        if msg.get("type") == "reply":
-            weight = 3
-        elif msg.get("type") == "quote":
-            weight = 2
-        elif msg.get("type") == "mention":
-            weight = 1
-
-        edge_weights[(sender, target)] += weight
+        # Treat every interaction type the same: weight = 1
+        edge_weights[(sender, target)] += 1
 
     # Filter and add strong edges
     for (sender, target), total_weight in edge_weights.items():
-        if total_weight >= 5:
+        if total_weight >= 1:
             g.add_edge(sender, target, weight=total_weight)
     print(f"Graph has {g.number_of_nodes()} nodes and {g.number_of_edges()} edges.")
     for edge in g.edges(data=True):
@@ -189,9 +181,6 @@ def load_tweets_dataset(file_path="res.json"):
             if not source:
                 continue
 
-            if tweet.get("retweetedTweet") and not tweet.get("quotedTweet") and not tweet.get("mentionedUsers"):
-                continue  # skip pure retweets
-
             # Track interactions and their type
             targets = set()
             # Extract mentioned users
@@ -224,7 +213,8 @@ def load_tweets_dataset(file_path="res.json"):
                     interaction_type = "retweet"
                 elif target in [m.get("username", "") for m in mentioned_users]:
                     interaction_type = "mention"
-                messages.append({"sender": source, "reply_to": target, "type": interaction_type})
+                messages.append({"sender": source, "reply_to": target,
+                                 "type": interaction_type})
     print(f"Loaded {len(messages)} messages.")
     if len(messages) < 5:
         print("First few messages:", messages[:5])
@@ -270,7 +260,8 @@ def main_hybrid(g, ax):
 
 
 # New function: Draw graph with KMeans cluster coloring
-def draw_kmeans_partitioned_graph(g, nodes, labels, title="Node2Vec + KMeans Community Detection"):
+def draw_kmeans_partitioned_graph(g, nodes, labels,
+                                  title="Node2Vec + KMeans Community Detection"):
     """
     Draw the graph with node colors based on KMeans clustering results.
     """
@@ -318,6 +309,10 @@ if __name__ == "__main__":
     low_degree_nodes = [n for n, d in g_real.degree() if d < 3]
     g_real.remove_nodes_from(low_degree_nodes)
     print(f"Removed {len(low_degree_nodes)} low-degree nodes.")
+    if g_real.number_of_nodes() == 0:
+        print("Graph is empty after filtering. Aborting.")
+        exit()
+
     if not nx.is_connected(g_real):
         largest_cc = max(nx.connected_components(g_real), key=len)
         g_real = g_real.subgraph(largest_cc).copy()
