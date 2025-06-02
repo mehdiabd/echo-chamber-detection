@@ -1,15 +1,35 @@
 """Community Detection on Sample Social Graph via NetworkX and community-louvain"""
-from collections import defaultdict
 import json
+from collections import defaultdict
+from pyvis.network import Network
 import networkx as nx
 import community as community_louvain
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib import colormaps
-from matplotlib.colors import ListedColormap
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
 from node2vec import Node2Vec
+
+
+# Interactive Graph Visualization with PyVis
+def visualize_graph_interactively(g, partition=None, title="Graph",
+                                  filename="graph.html"):
+    "Visualize a graph interactively using PyVis."
+    net = Network(height="800px", width="100%", notebook=False)
+    net.from_nx(g)
+
+    # Optional: color nodes by community/cluster
+    if partition:
+        for node, community_id in partition.items():
+            # visually distinct hues
+            color = f"hsl({(community_id * 47) % 360}, 70%, 60%)"
+            net.get_node(node)['color'] = color
+            net.get_node(node)['title'] = f"{node} (Community {community_id})"
+
+    net.force_atlas_2based()
+    net.show_buttons(filter_=['physics'])
+    net.show(filename)
+    print(f"Interactive graph saved to {filename}")
 
 
 # Visualization for Embeddings (PCA + Clusters)
@@ -54,39 +74,6 @@ def detect_communities_louvain(g):
     return partition
 
 
-# Plotting Function
-def draw_partitioned_graph(g, partition, title="Louvain Community Detection",
-                           method="Classic"):
-    """
-    Visualize the graph with node colors based on community partition.
-    Includes a legend indicating the community and detection method.
-    """
-    # Ensure the function operates within the current figure context
-    plt.gca().clear()  # Clear the current axes to avoid overlapping plots
-
-    pos = nx.spring_layout(g, seed=42, k=0.3, iterations=50)
-    # Use ListedColormap to limit colors
-    cmap = ListedColormap(colormaps["Set3"].colors[:max(partition.values()) + 1])
-
-    # Draw nodes with community colors
-    nx.draw_networkx_nodes(g, pos, node_size=300,
-                           node_color=list(partition.values()),
-                           cmap=cmap)
-    nx.draw_networkx_edges(g, pos, alpha=0.4)
-
-    # Add legend for communities
-    unique_communities = set(partition.values())
-    for community in unique_communities:
-        plt.scatter([], [], color=cmap(community), label=f"Community {community}"
-                    f" ({method})")
-
-    plt.title(f"{title} (Louvain)")
-    plt.legend(loc="center left", bbox_to_anchor=(-0.25, 0.5),
-               title="Communities")
-    plt.axis('off')
-    plt.tight_layout()
-
-
 # Main Louvain
 def main_louvain(g):
     """
@@ -103,8 +90,9 @@ def main_louvain(g):
     for node, comm in partition.items():
         print(f"Node {node}: Community {comm}")
 
-    # Draw the result
-    draw_partitioned_graph(g, partition)
+    # Add interactive visualization
+    visualize_graph_interactively(g, partition, title="Louvain Graph",
+                                  filename="louvain_graph.html")
 
 
 # HYBRID Approach: Node2Vec + Clustering
@@ -251,54 +239,113 @@ def main_hybrid(g, ax):
         print("Not enough embeddings for clustering.")
         return
 
-    labels = run_kmeans(embeddings, n_clusters=2)
+    labels = run_kmeans(embeddings, n_clusters=5)
 
-    # Visualize the results
-    draw_kmeans_partitioned_graph(g, nodes, labels)
     print(f"Number of nodes in graph: {len(g.nodes())}")
     print(f"Number of embeddings: {len(embeddings)}")
-
-
-# New function: Draw graph with KMeans cluster coloring
-def draw_kmeans_partitioned_graph(g, nodes, labels,
-                                  title="Node2Vec + KMeans Community Detection"):
-    """
-    Draw the graph with node colors based on KMeans clustering results.
-    """
-    # Clear the current axes
-    plt.gca().clear()
-
-    # Create a mapping from node to label
+    # Add interactive visualization
     partition = {node: labels[i] for i, node in enumerate(nodes)}
+    visualize_graph_interactively(g, partition, title="Hybrid Graph",
+                                  filename="hybrid_graph.html")
 
-    pos = nx.spring_layout(g, seed=42, k=0.3, iterations=50)
-    unique_labels = set(labels)
-    cmap = ListedColormap(plt.cm.get_cmap("tab10", len(unique_labels)).colors)
 
-    # Draw nodes with community colors
-    nx.draw_networkx_nodes(g, pos, node_size=300,
-                           node_color=[partition.get(node, 0) for node in g.nodes()],
-                           cmap=cmap)
-    nx.draw_networkx_edges(g, pos, alpha=0.4)
+# New function to visualize combined dashboard
+def visualize_combined_dashboard(g, louvain_partition, hybrid_partition,
+                                 filename="combined_graphs.html"):
+    """Visualize both Louvain and Hybrid community detection results in a combined
+     dashboard."""
 
-    # Add legend for clusters
-    for label in unique_labels:
-        plt.scatter([], [], color=cmap(label), label=f"Cluster {label} (KMeans)")
+    # Louvain graph
+    net1 = Network(height="600px", width="100%", notebook=False,
+                   heading="Louvain Graph")
+    net1.from_nx(g)
+    for node, community_id in louvain_partition.items():
+        color = f"hsl({(community_id * 47) % 360}, 70%, 60%)"
+        net1.get_node(node)['color'] = color
+        net1.get_node(node)['title'] = f"{node} (Louvain Community {community_id})"
 
-    plt.title(title)
-    plt.legend(loc="best", title="KMeans Clusters")
-    plt.axis('off')
-    plt.tight_layout()
+    # Set fixed layout positions for both graphs using spring_layout
+    import networkx as nx
+    pos = nx.spring_layout(g, seed=42)
+
+    # Disable physics only once
+    net1.set_options('{"physics": {"enabled": false}}')
+    for node in g.nodes():
+        x, y = pos[node]
+        net1.get_node(node)['x'] = x * 1000
+        net1.get_node(node)['y'] = y * 1000
+
+    net1.save_graph("louvain_graph.html")
+
+    # Hybrid graph
+    net2 = Network(height="600px", width="100%", notebook=False, heading="Hybrid Graph")
+    net2.from_nx(g)
+    for node, cluster_id in hybrid_partition.items():
+        color = f"hsl({(cluster_id * 67) % 360}, 70%, 60%)"
+        net2.get_node(node)['color'] = color
+        net2.get_node(node)['title'] = f"{node} (Hybrid Cluster {cluster_id})"
+
+    net2.set_options('{"physics": {"enabled": false}}')
+    for node in g.nodes():
+        x, y = pos[node]
+        net2.get_node(node)['x'] = x * 1000
+        net2.get_node(node)['y'] = y * 1000
+
+    net2.save_graph("hybrid_graph.html")
+
+    combined_html = """
+    <html>
+    <head>
+        <title>Combined Community Detection Dashboard</title>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                margin: 0;
+                padding: 0;
+            }
+            h2 {
+                text-align: center;
+                margin-top: 20px;
+            }
+            .container {
+                display: flex;
+                justify-content: space-around;
+                flex-wrap: wrap;
+                margin: 20px;
+            }
+            iframe {
+                border: none;
+                width: 48%;
+                height: 600px;
+            }
+            @media (max-width: 800px) {
+                iframe {
+                    width: 100%;
+                    height: 400px;
+                    margin-bottom: 20px;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <h2>Louvain vs Hybrid Community Detection</h2>
+        <div class="container">
+            <iframe src="louvain_graph.html" title="Louvain Graph"></iframe>
+            <iframe src="hybrid_graph.html" title="Hybrid Graph"></iframe>
+        </div>
+    </body>
+    </html>
+    """
+
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(combined_html)
+
+    print(f"Combined dashboard saved to {filename}")
 
 
 # Print community results
 if __name__ == "__main__":
     print("Running Louvain and Hybrid community detection...")
-
-    # Set up subplots
-    fig, axs = plt.subplots(1, 2, figsize=(14, 6))
-    plt.suptitle("Community Detection Methods: Louvain vs. Hybrid (Node2Vec + KMeans)",
-                 fontsize=16)
 
     # Louvain using real dataset
     real_messages = load_tweets_dataset()
@@ -316,13 +363,16 @@ if __name__ == "__main__":
     if not nx.is_connected(g_real):
         largest_cc = max(nx.connected_components(g_real), key=len)
         g_real = g_real.subgraph(largest_cc).copy()
-    plt.sca(axs[0])
     main_louvain(g_real)
 
     # Hybrid
-    plt.sca(axs[1])
-    main_hybrid(g_real, axs[1])
+    main_hybrid(g_real, None)
+
+    # Generate combined dashboard
+    partition_louvain = detect_communities_louvain(g_real)
+    embeddings, nodes = get_node_embeddings(g_real)
+    labels = run_kmeans(embeddings, n_clusters=5)
+    partition_hybrid = {node: labels[i] for i, node in enumerate(nodes)}
+    visualize_combined_dashboard(g_real, partition_louvain, partition_hybrid)
 
     print("Community detection completed.")
-    plt.tight_layout()
-    plt.show()

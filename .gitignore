@@ -25,3 +25,10 @@ res.json
 # experimental notebooks
 data_collection.ipynb
 *.ipynb
+
+
+# output graphs
+*.html
+
+# system files
+/lib
