@@ -16,14 +16,12 @@ __pycache__/
 
 # certificates
 *.pem
-ca.crt
 *.crt
 
 # results
-res.json 
+*.json 
 
 # experimental notebooks
-data_collection.ipynb
 *.ipynb
 
 
@@ -32,3 +30,10 @@ data_collection.ipynb
 
 # system files
 /lib
+
+# data files
+*.pdf
+*.txt
+
+# logs
+*.log

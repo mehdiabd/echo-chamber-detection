@@ -9,6 +9,8 @@ import numpy as np
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
 from node2vec import Node2Vec
+from datetime import datetime, timedelta
+from dateutil.relativedelta import relativedelta
 
 
 # Interactive Graph Visualization with PyVis
@@ -25,6 +27,15 @@ def visualize_graph_interactively(g, partition=None, title="Graph",
             color = f"hsl({(community_id * 47) % 360}, 70%, 60%)"
             net.get_node(node)['color'] = color
             net.get_node(node)['title'] = f"{node} (Community {community_id})"
+
+    # Show node labels if label_map is present, regardless of partition
+    if hasattr(g, "graph") and "label_map" in g.graph:
+        label_map = g.graph["label_map"]
+        for node in g.nodes():
+            label = label_map.get(node)
+            if label:
+                title = net.get_node(node).get("title", node)
+                net.get_node(node)['title'] = f"{title} ({label})"
 
     net.force_atlas_2based()
     net.show_buttons(filter_=['physics'])
@@ -105,7 +116,7 @@ def build_user_graph(messages):
 
     for msg in messages:
         sender = msg.get("sender")
-        target = msg.get("reply_to")
+        target = msg.get("target")
         if not sender or not target or sender == target:
             continue
 
@@ -151,61 +162,24 @@ def get_node_embeddings(g, dimensions=64):
     return embeddings, nodes
 
 
-# Data Collection: Load Tweets Dataset
-def load_tweets_dataset(file_path="res.json"):
+# Data Collection: Load Interactions Dataset
+def load_interactions(file_path="interactions.json"):
     """
-    Load tweets dataset from a JSON file and extract relevant fields.
+    Load sender-target interactions from a JSON lines file.
+    Each line is a dict with keys: sender, target, type
     """
     messages = []
     with open(file_path, "r", encoding="utf-8") as f:
-        try:
-            data = json.load(f)
-        except json.JSONDecodeError as e:
-            print("Failed to load JSON file:", e)
-            return []
-
-        for tweet in data:
-            source = tweet.get("user", {}).get("username")
-            if not source:
+        for line in f:
+            try:
+                msg = json.loads(line)
+                sender = msg.get("sender")
+                target = msg.get("target")
+                if sender and target and sender != target:
+                    messages.append(msg)
+            except json.JSONDecodeError:
                 continue
-
-            # Track interactions and their type
-            targets = set()
-            # Extract mentioned users
-            mentioned_users = tweet.get("mentionedUsers", [])
-            for m in mentioned_users:
-                if isinstance(m, dict) and "username" in m:
-                    targets.add(m["username"])
-
-            # Extract quoted tweet user
-            quoted = tweet.get("quotedTweet")
-            quoted_user = {}
-            if quoted and isinstance(quoted, dict):
-                quoted_user = quoted.get("user", {})
-                if isinstance(quoted_user, dict) and "username" in quoted_user:
-                    targets.add(quoted_user["username"])
-
-            # Extract retweeted tweet user
-            retweeted = tweet.get("retweetedTweet")
-            retweeted_user = {}
-            if retweeted and isinstance(retweeted, dict):
-                retweeted_user = retweeted.get("user", {})
-                if isinstance(retweeted_user, dict) and "username" in retweeted_user:
-                    targets.add(retweeted_user["username"])
-
-            for target in targets:
-                interaction_type = "mention"  # default
-                if target == quoted_user.get("username", ""):
-                    interaction_type = "quote"
-                elif target == retweeted_user.get("username", ""):
-                    interaction_type = "retweet"
-                elif target in [m.get("username", "") for m in mentioned_users]:
-                    interaction_type = "mention"
-                messages.append({"sender": source, "reply_to": target,
-                                 "type": interaction_type})
-    print(f"Loaded {len(messages)} messages.")
-    if len(messages) < 5:
-        print("First few messages:", messages[:5])
+    print(f"Loaded {len(messages)} interactions.")
     return messages
 
 
@@ -343,36 +317,152 @@ def visualize_combined_dashboard(g, louvain_partition, hybrid_partition,
     print(f"Combined dashboard saved to {filename}")
 
 
+def generate_time_slots(start_date, end_date, slot_type):
+    slots = []
+    current = start_date
+    while current <= end_date:
+        if slot_type == "daily":
+            next_slot = current + timedelta(days=1)
+        elif slot_type == "weekly":
+            next_slot = current + timedelta(weeks=1)
+        else:  # monthly
+            next_slot = current + relativedelta(months=1)
+
+        slot_end = min(next_slot - timedelta(days=1), end_date)
+        slots.append((current, slot_end))
+        current = next_slot
+    return slots
+
+
 # Print community results
 if __name__ == "__main__":
     print("Running Louvain and Hybrid community detection...")
 
-    # Louvain using real dataset
-    real_messages = load_tweets_dataset()
-    if not real_messages:
-        print("No valid messages found in dataset.")
-        exit()
-    g_real = build_user_graph(real_messages)
-    low_degree_nodes = [n for n, d in g_real.degree() if d < 3]
-    g_real.remove_nodes_from(low_degree_nodes)
-    print(f"Removed {len(low_degree_nodes)} low-degree nodes.")
-    if g_real.number_of_nodes() == 0:
-        print("Graph is empty after filtering. Aborting.")
-        exit()
+    start_date = datetime.strptime("2025-03-01", "%Y-%m-%d")
+    end_date = datetime.strptime("2025-04-28", "%Y-%m-%d")
+    delta_days = (end_date - start_date).days
+    if delta_days <= 7:
+        slot_type = "daily"
+    elif delta_days <= 60:
+        slot_type = "weekly"
+    else:
+        slot_type = "monthly"
+    print(f"Slot type selected: {slot_type}")
+    slots = generate_time_slots(start_date, end_date, slot_type)
 
-    if not nx.is_connected(g_real):
-        largest_cc = max(nx.connected_components(g_real), key=len)
-        g_real = g_real.subgraph(largest_cc).copy()
-    main_louvain(g_real)
+    for idx, (slot_start, slot_end) in enumerate(slots):
+        print(f"\nProcessing slot {slot_start.date()} to {slot_end.date()}...")
 
-    # Hybrid
-    main_hybrid(g_real, None)
+        messages = []
+        all_messages = load_interactions()
+        for msg in all_messages:
+            date_str = msg.get("date")
+            if not date_str:
+                continue
+            try:
+                msg_date = datetime.strptime(date_str[:10], "%Y-%m-%d").date()
+                if slot_start.date() <= msg_date <= slot_end.date():
+                    messages.append(msg)
+            except Exception as e:
+                print(f"Skipping message with invalid date: {date_str} → {e}")
+                continue
+        if not messages:
+            print("No valid messages found in this slot.")
+            continue
 
-    # Generate combined dashboard
-    partition_louvain = detect_communities_louvain(g_real)
-    embeddings, nodes = get_node_embeddings(g_real)
-    labels = run_kmeans(embeddings, n_clusters=5)
-    partition_hybrid = {node: labels[i] for i, node in enumerate(nodes)}
-    visualize_combined_dashboard(g_real, partition_louvain, partition_hybrid)
+        g_slot = build_user_graph(messages)
+        low_degree_nodes = [n for n, d in g_slot.degree() if d < 1]
+        g_slot.remove_nodes_from(low_degree_nodes)
+        if g_slot.number_of_nodes() == 0:
+            print("Graph is empty after filtering. Skipping.")
+            continue
+
+        if not nx.is_connected(g_slot):
+            largest_cc = max(nx.connected_components(g_slot), key=len)
+            g_slot = g_slot.subgraph(largest_cc).copy()
+
+        partition_louvain = detect_communities_louvain(g_slot)
+        embeddings, nodes = get_node_embeddings(g_slot)
+        labels = run_kmeans(embeddings, n_clusters=5)
+        partition_hybrid = {node: labels[i] for i, node in enumerate(nodes)}
+
+        visualize_combined_dashboard(
+            g_slot,
+            partition_louvain,
+            partition_hybrid,
+            filename=f"dashboard_{slot_start.strftime('%y%m%d')}_to_{slot_end.strftime('%y%m%d')}.html"
+        )
+
 
     print("Community detection completed.")
+
+
+# --- Timeline Dashboard Generator ---
+import os
+
+def generate_timeline_dashboard(output_file="timeline_dashboard.html"):
+    """
+    Generates an interactive dashboard that allows switching between time slot graphs.
+    """
+    dashboards = sorted([
+        f for f in os.listdir(".")
+        if f.startswith("dashboard_") and f.endswith(".html") and "_to_" in f
+    ])
+
+    if not dashboards:
+        print("No dashboard_*.html files found.")
+        return
+
+    options_html = ""
+    iframes_html = ""
+
+    for i, dash in enumerate(dashboards):
+        visible = "block" if i == 0 else "none"
+        label = dash.replace("dashboard_", "").replace(".html", "").replace("_to_", " → ")
+        options_html += f'<option value="{dash}">{label}</option>\n'
+        iframes_html += f'<iframe id="{dash}" src="{dash}" style="display: {visible}; width: 100%; height: 650px; border: none;"></iframe>\n'
+
+    html_content = f"""
+    <html>
+    <head>
+        <title>Timeline Graph Viewer</title>
+        <style>
+            body {{
+                font-family: Arial, sans-serif;
+                margin: 0;
+                padding: 20px;
+            }}
+            select {{
+                font-size: 16px;
+                padding: 8px;
+                margin-bottom: 20px;
+            }}
+        </style>
+        <script>
+            function showGraph() {{
+                var selected = document.getElementById("graphSelector").value;
+                var iframes = document.getElementsByTagName("iframe");
+                for (var i = 0; i < iframes.length; i++) {{
+                    iframes[i].style.display = "none";
+                }}
+                document.getElementById(selected).style.display = "block";
+            }}
+        </script>
+    </head>
+    <body>
+        <h2>Select Time Slot:</h2>
+        <select id="graphSelector" onchange="showGraph()">
+            {options_html}
+        </select>
+        <div>
+            {iframes_html}
+        </div>
+    </body>
+    </html>
+    """
+
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write(html_content)
+    print(f"Timeline dashboard saved to {output_file}")
+
+    generate_timeline_dashboard()
