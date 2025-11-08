@@ -10,4 +10,6 @@ scikit-learn==1.3.0    # For k-means, PCA, evaluation
 matplotlib==3.8.0
 pyvis==0.3.2
 
+# Search & retrieval
 elasticsearch
+ollama

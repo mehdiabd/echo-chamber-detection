@@ -19,11 +19,18 @@ def normalize_json(input_file):
             if not line:
                 continue
             try:
-                # Convert Python-style dict to JSON
-                python_dict = ast.literal_eval(line)
-                valid_json_list.append(python_dict)
-            except (ValueError, SyntaxError):
-                print(f"Skipping invalid line: {line}")
+                # Parse line as JSON
+                python_dict = json.loads(line)
+                # print("Parsed line:", python_dict)
+                if not all(k in python_dict for k in ["user_name", "user_title", "political_label"]):
+                    # print(f"❌ Skipped line (missing required keys): {python_dict}")
+                    continue
+                else:
+                    # print(f"✅ Kept line: {python_dict}")
+                    valid_json_list.append(python_dict)
+            except json.JSONDecodeError as e:
+                print(e)
+                continue
 
     # Write the "Total hits" line and valid JSON array back to the file
     with open(input_file, 'w', encoding='utf-8') as file:
