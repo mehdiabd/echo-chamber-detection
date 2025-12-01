@@ -19,55 +19,69 @@ from elastic import es, INDEX, log as es_log
 from elasticsearch.helpers import scan
 
 
-def fetch_community_texts(accounts: List[str], start_date: str = None, 
+def fetch_community_texts(accounts: List[str], start_date: str = None,
                         end_date: str = None, max_texts: int = 10) -> Dict[str, List[str]]:
-    """Fetch recent texts for a list of accounts from Elasticsearch."""
+    """Fetch recent texts for a list of accounts from Elasticsearch.
+
+    Robust behavior:
+    - Reuse `es` and `INDEX` from elastic.py
+    - Try username fields: user_name.keyword, user_name, sender.keyword, sender
+    - Prefer `normalized_text` then fallback to `text`/`content`
+    - Try sorting by `date` but fall back to unsorted if mapping missing
+    - Print a 3-item debug preview for the first account (center) so we can verify
+    """
     try:
-        # Build query
-        query = {
-            "bool": {
-                "must": [{"terms": {"sender": accounts}}]
-            }
-        }
+        es_client = es  # from elastic.py import
+    except Exception:
+        raise RuntimeError("Elasticsearch client `es` not available from elastic.py")
 
-        # Add date range if provided
-        if start_date and end_date:
-            query["bool"]["filter"] = [{
-                "range": {
-                    "date": {
-                        "gte": start_date,
-                        "lte": end_date
-                    }
-                }
-            }]
+    index = INDEX
+    username_fields = ["user_name.keyword", "user_name", "sender.keyword", "sender"]
+    results: Dict[str, List[str]] = {acct: [] for acct in accounts}
 
-        # Execute search
-        results = scan(
-            es,
-            query={"query": query},
-            index=INDEX,
-            _source=["sender", "text", "date"],
-            size=100
-        )
+    for i, acct in enumerate(accounts):
+        hits = []
+        for field in username_fields:
+            if field.endswith('.keyword'):
+                body = {"query": {"term": {field: acct}}}
+            else:
+                body = {"query": {"match": {field: acct}}}
 
-        # Collect texts by account
-        texts_by_account = defaultdict(list)
-        for hit in results:
-            source = hit["_source"]
-            sender = source.get("sender")
-            text = source.get("text", "").strip()
-            if sender and text:
-                texts_by_account[sender].append(text)
+            # apply date range if provided
+            if start_date and end_date:
+                body = {"bool": {"must": [body["query"]], "filter": [{"range": {"date": {"gte": start_date, "lte": end_date}}}]}}
 
-        # Trim to max_texts per account
-        return {
-            account: texts[:max_texts] 
-            for account, texts in texts_by_account.items()
-        }
- 
-    except Exception as e:
-        es_log.error(f"Error fetching texts: {e}")
-        return {}
+            # try sorted query first, then fallback to unsorted if ES complains
+            try:
+                body_with_sort = dict(body)
+                body_with_sort["sort"] = [{"date": {"order": "desc"}}]
+                resp = es_client.search(index=index, body=body_with_sort, size=max_texts)
+            except Exception:
+                try:
+                    resp = es_client.search(index=index, body=body, size=max_texts)
+                except Exception:
+                    resp = {"hits": {"hits": []}}
+
+            hits = resp.get("hits", {}).get("hits", [])
+            if hits:
+                break
+
+        tweets = []
+        for h in hits:
+            src = h.get("_source", {}) or {}
+            text = src.get("normalized_text") or src.get("text") or src.get("content") or ""
+            if text and isinstance(text, str):
+                tweets.append(text.strip())
+
+        results[acct] = tweets[:max_texts]
+
+        # debug preview for the first account (likely the center)
+        if i == 0:
+            print(f"[debug] Sample normalized tweets for {acct} (count={len(tweets)}):")
+            for t in tweets[:3]:
+                print("   →", t[:200])
+
+    return results
 
 
 _ai_name_cache = {}
@@ -85,10 +99,11 @@ except Exception as e:
     print(f"[Org LLM] Not available → {e}")
 
 
-def call_llm(prompt: str, backend="org"):
+def call_llm(prompt: str, backend="org", temperature: float = 0.6, max_tokens: int = 60):
     """
-    Generic LLM caller.
+    Generic LLM caller with temperature control.
     backend: "org" or "local_llama"
+    temperature: creativity control (0.0 - 1.0)
     """
     if backend == "org":
         if not ORG_LLM_MODEL or not ORG_LLM_URL:
@@ -97,13 +112,20 @@ def call_llm(prompt: str, backend="org"):
             payload = {
                 "model": ORG_LLM_MODEL,
                 "messages": [
-                    {"role": "system", "content":
-                        "شما یک متخصص در نام‌گذاری جوامع و گروه‌های اجتماعی هستید."},
+                    {"role": "system", "content": "شما یک متخصص در نام‌گذاری جوامع و گروه‌های اجتماعی هستید."},
                     {"role": "user", "content": prompt}
-                ]
+                ],
+                "temperature": temperature,
+                "max_tokens": max_tokens
             }
             resp = requests.post(ORG_LLM_URL, json=payload, timeout=30)
-            return resp.json()["choices"][0]["message"]["content"].strip()
+            data = resp.json()
+            # defensive path for different response shapes
+            if isinstance(data, dict) and "choices" in data:
+                return data["choices"][0]["message"]["content"].strip()
+            if isinstance(data, dict) and "result" in data:
+                return data["result"].strip()
+            return None
         except Exception as e:
             print(f"[Org LLM] Failed → {e}")
             return None
@@ -111,23 +133,12 @@ def call_llm(prompt: str, backend="org"):
         try:
             response = ollama.chat(
                 model="llama3.1",
-                    messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "تو یک متخصص در نام‌گذاری جوامع و "
-                            "گروه‌های اجتماعی رسانه‌های اجتماعی هستی."
-                        )
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
+                messages=[
+                    {"role": "system", "content": "تو یک متخصص در نام‌گذاری جوامع و گروه‌های اجتماعی هستی."},
+                    {"role": "user", "content": prompt}
                 ],
-                options={
-                    "temperature": 0.1,
-                    "num_predict": 10   # 10-token limit
-                })
+                options={"temperature": temperature, "num_predict": max_tokens}
+            )
             return response['message']['content'].strip()
         except Exception as e:
             print(f"[Local Llama] Failed → {e}")
@@ -136,12 +147,12 @@ def call_llm(prompt: str, backend="org"):
         raise ValueError(f"Unknown backend: {backend}")
 
 
-def call_local_llama(prompt: str):
-    return call_llm(prompt, backend="local_llama")
+def call_local_llama(prompt: str, temperature: float = 0.5):
+    return call_llm(prompt, backend="local_llama", temperature=temperature, max_tokens=60)
 
 
-def call_org_llm(prompt: str):
-    return call_llm(prompt, backend="org")
+def call_org_llm(prompt: str, temperature: float = 0.75):
+    return call_llm(prompt, backend="org", temperature=temperature, max_tokens=80)
 
 
 # --- Helper: Extract recent texts from Elasticsearch or file ---
@@ -439,126 +450,104 @@ def analyze_community_texts(texts, members):
     return matched_themes[0] if matched_themes else None
 
 
-def ai_name_community(center_node, neighbors, node_label_map, comm_id, method, time_period=None):
-    """Generate meaningful community name using advanced content analysis."""
-    print(f"[DEBUG] ai_name_community called: center={center_node}, neighbors={len(neighbors)}, method={method}")
-    try:
-        # 1. Check predefined names
-        if result := node_label_map.get(center_node):
-            save_community_name(result, center_node, neighbors, comm_id, method, time_period)
-            return result
+def ai_name_community(center_node, neighbors, node_label_map, comm_id, method, time_period=None, g=None):
+    """
+    Naming pipeline using tweets and strict LLM priority:
+      1) Company LLM (creative)
+      2) Local LLM (conservative)
+      3) NODE_LABEL_MAP (dictionary)
+      4) Final fallback: 'ناشناس'
 
-        # 2. Fetch and analyze community texts
-        texts = fetch_community_texts_from_file(
-            center_node, neighbors, filepath="res.json", size=15
-        ) or {}
-        
-        if not texts:
-            return "جامعه کوچک ناشناس"
-        
-        # Combine all texts for analysis
-        all_texts = []
-        for node_texts in texts.values():
-            if isinstance(node_texts, list):
-                all_texts.extend(node_texts)
-            else:
-                all_texts.append(node_texts)
-        
-        full_text = " ".join(all_texts).lower()
-        
-        # 3. Advanced content categorization
-        categories = {
-            "خبری": {
-                "patterns": ["خبر", "گزارش", "اطلاع", "رسان", "پوشش", "منتشر", "اعلام"],
-                "roles": ["خبرگزاری", "خبرنگاران", "رسانه خبری"]
-            },
-            "تحلیلی": {
-                "patterns": ["تحلیل", "بررسی", "پژوهش", "مطالعه", "ارزیابی"],
-                "roles": ["تحلیلگران", "پژوهشگران", "منتقدان"]
-            },
-            "سیاسی": {
-                "patterns": ["سیاست", "دولت", "مجلس", "انتخاب", "نظام", "حزب"],
-                "roles": ["فعالان سیاسی", "اصلاح‌طلبان", "اصولگرایان"]
-            },
-            "اجتماعی": {
-                "patterns": ["جامعه", "مردم", "شهروند", "اجتماع", "حقوق"],
-                "roles": ["فعالان مدنی", "کنشگران اجتماعی", "حقوق‌بشری"]
-            },
-            "فرهنگی": {
-                "patterns": ["فرهنگ", "هنر", "ادب", "سینما", "موسیق", "تئاتر"],
-                "roles": ["هنرمندان", "سینماگران", "نویسندگان"]
-            },
-            "اقتصادی": {
-                "patterns": ["اقتصاد", "بازار", "تورم", "ارز", "قیمت", "بورس"],
-                "roles": ["تحلیلگران اقتصادی", "فعالان بازار", "اقتصاددانان"]
-            },
-            "بین‌المللی": {
-                "patterns": ["جهان", "بین‌الملل", "دیپلماسی", "خارج", "کشور"],
-                "roles": ["تحلیلگران بین‌المللی", "دیپلمات‌ها", "خبرنگاران خارجی"]
-            }
-        }
-        
-        # Calculate scores for each category
-        category_scores = {}
-        for cat, info in categories.items():
-            score = sum(full_text.count(p) for p in info["patterns"])
-            if score > 0:
-                category_scores[cat] = score
-        
-        # 4. Generate meaningful name
-        if category_scores:
-            # Get top 2 categories
-            top_categories = sorted(
-                category_scores.items(),
-                key=lambda x: x[1],
-                reverse=True
-            )[:2]
-            
-            main_cat = top_categories[0][0]
-            main_roles = categories[main_cat]["roles"]
-            
-            # Select appropriate role based on text analysis
-            role_scores = {}
-            for role in main_roles:
-                role_words = role.split()
-                role_score = sum(
-                    full_text.count(word) 
-                    for word in role_words
-                )
-                role_scores[role] = role_score
-            
-            # Get best matching role
-            if role_scores:
-                best_role = max(role_scores.items(), key=lambda x: x[1])[0]
-            else:
-                best_role = main_roles[0]
-            
-            # Add secondary category if significant
-            if len(top_categories) > 1 and top_categories[1][1] >= top_categories[0][1] * 0.3:
-                second_cat = top_categories[1][0]
-                result = f"{best_role} با گرایش {second_cat}"
-            else:
-                result = best_role
-        else:
-            # Fallback: analyze center node name
-            center_lower = center_node.lower()
-            if any(k in center_lower for k in ["news", "خبر", "bbc", "voa"]):
-                result = "شبکه خبری"
-            elif any(k in center_lower for k in ["art", "هنر", "cinema"]):
-                result = "شبکه فرهنگی"
-            elif any(k in center_lower for k in ["polit", "سیاس"]):
-                result = "گروه سیاسی"
-            else:
-                result = f"جامعه {center_node}"
-        
-        # 5. Save to file
-        save_community_name(result, center_node, neighbors, comm_id, method, time_period)
-        
-        return result
-        
+    This function will also attach the final label to graph nodes under
+    g.nodes[node]['community_label'] when a graph object `g` is provided.
+    """
+    try:
+        # 1. Try dictionary quickly (but still attempt LLMs for creativity unless dict is explicit)
+        dict_label = node_label_map.get(center_node)
+
+        # 2. Fetch live texts for center + up to 3 top neighbors
+        sample_neighbors = neighbors[:3] if neighbors else []
+        nodes = [center_node] + sample_neighbors
+        texts_map = fetch_community_texts(nodes, max_texts=6)
+
+        # Build context from available normalized_texts
+        parts = []
+        for n in nodes:
+            tlist = texts_map.get(n, [])
+            if tlist:
+                parts.append(f"{n}: {' | '.join(tlist[:2])}")
+        context = "\n".join(parts)
+
+        # Load few-shot examples for style guidance
+        few_shot = load_few_shot_examples(2)
+
+        prompt = f"""
+You are a professional analyst in social network analysis. Provide a single, concise Persian community name (max 3-4 words) that reflects the community's dominant theme or role. Avoid usernames and any extraneous punctuation. Return only the label text.
+
+Examples:
+{few_shot}
+
+Context (sample tweets):
+{context}
+
+Answer (label only):
+"""
+
+        candidate = None
+
+        # 3. Try company LLM (higher creativity)
+        try:
+            candidate = call_org_llm(prompt, temperature=0.75)
+        except Exception:
+            candidate = None
+
+        # 4. If org LLM fails or returns invalid output, try local LLM (more conservative)
+        if not candidate or not is_valid_label(clean_label(candidate, default=None)):
+            try:
+                candidate_local = call_local_llama(prompt, temperature=0.5)
+                if candidate_local and is_valid_label(clean_label(candidate_local, default=None)):
+                    candidate = candidate_local
+            except Exception:
+                pass
+
+        # 5. If still no candidate, fall back to dictionary label
+        if not candidate:
+            candidate = dict_label
+
+        # 6. Clean and final validation
+        final_label = clean_label(candidate, default="ناشناس")
+        if not is_valid_label(final_label):
+            final_label = "ناشناس"
+
+        # 7. Persist and annotate graph nodes if provided
+        try:
+            save_community_name(final_label, center_node, neighbors, comm_id, method, time_period)
+        except Exception:
+            pass
+
+        if g is not None:
+            # Attach label to all nodes in community (center + neighbors)
+            for n in [center_node] + list(neighbors):
+                if n in g.nodes:
+                    g.nodes[n]["community_label"] = final_label
+
+        # 8. Append to communities summary
+        if not hasattr(ai_name_community, "communities"):
+            ai_name_community.communities = []
+        ai_name_community.communities.append({
+            "id": comm_id,
+            "name": final_label,
+            "center_node": center_node,
+            "members": neighbors,
+            "method": method,
+            "member_count": len(neighbors)
+        })
+
+        return final_label
+
     except Exception as e:
-        print(f"[error] Community naming failed: {e}")
-        return "جامعه کوچک ناشناس"
+        print(f"[error] naming community {comm_id}: {e}")
+        return "ناشناس"
 
 
 # Map of key accounts to their community identities
@@ -921,118 +910,71 @@ def clean_graph(g):
 
 # ---- Helper: Style Partition ----
 def style_partition(g, net, partition, method, base_hue):
-    """Style nodes and add legend for community visualization.
-    
-    Applies colors, sizes and tooltips based on community structure."""
-    if g.number_of_nodes() == 0:
+    """Style nodes using stored labels and return legend data with matching colors."""
+    if g.number_of_nodes() == 0 or not partition:
         return {}
 
-    # Get community centers and initialize structures
     centers = get_community_centers(g, partition)
-    community_info = defaultdict(lambda: {
-        "nodes": [],
-        "count": 0,
-        "color": None,
-        "center": None
-    })
-
-    # First pass: analyze communities and assign initial labels
+    communities = []
     for comm_id, center in centers.items():
-        # Get community members
-        community_nodes = [n for n, c in partition.items() if c == comm_id]
-        neighbors = [n for n in community_nodes if n != center]
-        
-        # Generate unique label
-        label = ai_name_community(center, neighbors, NODE_LABEL_MAP, comm_id, method, g)
-        
-        # Store complete community info
-        info = community_info[label]
-        info["nodes"].extend(community_nodes)
-        info["count"] = len(community_nodes)
-        info["center"] = center
-        
-    # Generate distinct colors
-    sorted_communities = sorted(
-        community_info.items(),
-        key=lambda x: x[1]["count"],
-        reverse=True
-    )
-    
-    # Use golden ratio for optimal color distribution
-    golden_ratio = 0.618033988749895
-    num_communities = len(sorted_communities)
-    
-    for i, (label, info) in enumerate(sorted_communities):
-        # Base hue distribution
-        hue = (i * 360 * golden_ratio) % 360
-        
-        # Adjust saturation based on community size
-        base_saturation = 75
-        size_boost = min(info["count"] * 2, 15)  # Max 15% boost
-        saturation = min(base_saturation + size_boost, 90)
-        
-        # Keep good lightness for visibility
-        lightness = 60
-        
-        info["color"] = f"hsl({hue},{saturation}%,{lightness}%)"
-
-    # Apply node styling with improved visualization
-    pos = nx.spring_layout(g, seed=42)
-    
-    for node in g.nodes():
-        # Find node's community
-        comm_id = partition[node]
-        
-        # Get the label for this node's community
-        node_label = None
-        for label, info in community_info.items():
-            if node in info["nodes"]:
-                node_label = label
-                break
-                
-        if not node_label:
+        members = [n for n, c in partition.items() if c == comm_id]
+        if not members:
             continue
-            
-        # Get community info
-        info = community_info[node_label]
-        
-        # Calculate node size based on role and degree
-        base_size = 15
-        degree_boost = min(g.degree(node) * 2, 25)
-        center_boost = 15 if node == info["center"] else 0
-        size = base_size + degree_boost + center_boost
-        
-        # Node styling with improved tooltips
-        node_data = {
-            "id": node,
-            "label": node,
-            "color": info["color"],
-            "title": f"{node} ({node_label})",
-            "size": size,
-            "x": float(pos[node][0] * 1000),
-            "y": float(pos[node][1] * 1000),
-            "physics": True,
-            "borderWidth": 2 if node == info["center"] else 1,
-            "borderWidthSelected": 3,
-            "font": {
-                "size": 14,
-                "face": "Vazirmatn"
-            }
+        label = g.nodes[center].get("community_label")
+        if not label:
+            neighbors = [n for n in members if n != center]
+            label = ai_name_community(center, neighbors, NODE_LABEL_MAP, comm_id, method, g=g)
+        if not label:
+            label = NODE_LABEL_MAP.get(center, f"گروه {comm_id}")
+        for node in members:
+            g.nodes[node]["community_label"] = label
+        communities.append({
+            "id": comm_id,
+            "label": label,
+            "center": center,
+            "members": members
+        })
+
+    if not communities:
+        return {}
+
+    golden_ratio = 0.618033988749895
+    legend_map: Dict[str, Dict[str, Any]] = {}
+
+    sorted_communities = sorted(communities, key=lambda c: len(c["members"]), reverse=True)
+    for idx, community in enumerate(sorted_communities):
+        hue = (base_hue + idx * 360 * golden_ratio) % 360
+        saturation = min(70 + len(community["members"]) * 1.5, 90)
+        lightness = 58
+        color = f"hsl({hue},{saturation}%,{lightness}%)"
+
+        display_label = community["label"]
+
+        for node in community["members"]:
+            node_data = net.get_node(node)
+            if not node_data:
+                continue
+            degree_boost = min(g.degree(node) * 2, 25)
+            role_boost = 15 if node == community["center"] else 0
+            size = 15 + degree_boost + role_boost
+            node_data.update({
+                "color": color,
+                "label": node,
+                "title": f"{node}\nجامعه: {display_label}",
+                "size": size,
+                "shape": "dot",
+                "borderWidth": 2 if node == community["center"] else 1,
+                "borderWidthSelected": 3,
+                "font": {"size": 14, "face": "Vazirmatn"},
+                "physics": True,
+            })
+
+        legend_map[display_label] = {
+            "color": color,
+            "count": len(community["members"])
         }
-        
-        # Add any available metadata
-        if hasattr(g, "graph") and "meta_map" in g.graph:
-            meta = g.graph["meta_map"].get(node)
-            if meta:
-                node_data["title"] += "<br>" + "<br>".join(
-                    f"{k}: {v}" for k, v in meta.items()
-                )
-        
-        # Update node in network
-        net.get_node(node).update(node_data)
-    
-    # Return color mapping for legend
-    return {label: info["color"] for label, info in community_info.items()}
+
+    return legend_map
 
 
 # ---- Helper: Visualize or Dummy ----
@@ -1123,7 +1065,7 @@ def visualize_or_dummy(slot_start, slot_end, g, louvain=None, hybrid=None):
 
     try:
         # Reset community store before detection
-        if hasattr(ai_name_community, "communities"):
+        if not hasattr(ai_name_community, "communities"):
             ai_name_community.communities = []
 
         # IMPORTANT: Call ai_name_community for each community
@@ -1187,8 +1129,6 @@ def visualize_or_dummy(slot_start, slot_end, g, louvain=None, hybrid=None):
             with open(output_path, "w", encoding="utf-8") as f:
                 json.dump(communities_data, f, ensure_ascii=False, indent=2)
             print(f"[saved] {output_path}")
-            
-            ai_name_community.communities = []
 
         # Create base legend data
         legend_data = {
@@ -1265,106 +1205,61 @@ def create_community_network():
 
 
 def visualize_combined_dashboard(g, louvain_partition, hybrid_partition, filename):
-    """Generate visualizations for both Louvain and Hybrid methods."""
+    """Generate visualizations for both Louvain and Hybrid methods (refactored).
+    Writes canonical legend JSON based on g.nodes[node]['community_label'].
+    """
     # Generate paths
     louvain_html = filename.replace("dashboard_", "louvain_graph_")
     hybrid_html = filename.replace("dashboard_", "hybrid_graph_")
     legend_path = filename.replace(".html", "_legend.json")
 
-    # Create networks
     net1 = create_community_network()
     net2 = create_community_network()
 
-    # Handle empty graph case
     if g.number_of_nodes() == 0:
         empty_data = {"louvain": {"groups": {}}, "hybrid": {"groups": {}}}
         with open(legend_path, 'w', encoding='utf-8') as f:
             json.dump(empty_data, f, ensure_ascii=False, indent=2)
-        
-        # Save empty networks
         net1.save_graph(louvain_html)
         net2.save_graph(hybrid_html)
+        print(f"[saved] {louvain_html}, {hybrid_html}, {legend_path}")
         return
 
-    # Build visualizations
-    louvain_colors = build_community_visualization(
-        g, louvain_partition, net1, "Louvain"
-    )
-    hybrid_colors = build_community_visualization(
-        g, hybrid_partition, net2, "Hybrid"
-    )
-    
+    # build visualizations and style partitions (this will also attach community_label to nodes)
+    louvain_colors = build_community_visualization(g, louvain_partition, net1, "Louvain")
+    louvain_colors = style_partition(g, net1, louvain_partition, "louvain", 47)
+    hybrid_colors = build_community_visualization(g, hybrid_partition, net2, "Hybrid")
+    hybrid_colors = style_partition(g, net2, hybrid_partition, "hybrid", 200)
+
     # Save networks
     net1.save_graph(louvain_html)
     net2.save_graph(hybrid_html)
     print(f"[saved] {louvain_html}, {hybrid_html}")
 
-    # Generate legend data with improved counting
     legend_data = {
-        "louvain": {"groups": {}},
-        "hybrid": {"groups": {}}
+        "louvain": {"groups": louvain_colors},
+        "hybrid": {"groups": hybrid_colors}
     }
-    
-    # Process Louvain communities
-    for label, color in louvain_colors.items():
-        count = sum(
-            1 for node in louvain_partition 
-            if label in net1.get_node(node)['title']
-        )
-        if count > 0:
-            legend_data["louvain"]["groups"][label] = {
-                "color": color,
-                "count": count
-            }
-    
-    # Process Hybrid communities
-    for label, color in hybrid_colors.items():
-        count = sum(
-            1 for node in hybrid_partition
-            if label in net2.get_node(node)['title']
-        )
-        if count > 0:
-            legend_data["hybrid"]["groups"][label] = {
-                "color": color,
-                "count": count
-            }
-    
-    # Save legend data
+
+    # Overwrite legend file (always regenerate)
+    try:
+        if os.path.exists(legend_path):
+            os.remove(legend_path)
+    except Exception:
+        pass
+
     with open(legend_path, 'w', encoding='utf-8') as f:
         json.dump(legend_data, f, ensure_ascii=False, indent=2)
     print(f"[saved] {legend_path}")
 
-    # Read utils.js content
+    # read utils and generate dashboard
     with open("lib/bindings/utils.js", encoding='utf-8') as f:
         utils_js = f.read()
-        
-    # Generate and write dashboard HTML
-    dashboard_html = generate_dashboard_html(
-        louvain_html, hybrid_html, legend_path, utils_js
-    )
-    
-    # Write the final dashboard
+
+    dashboard_html = generate_dashboard_html(louvain_html, hybrid_html, legend_path, utils_js)
     with open(filename, 'w', encoding='utf-8') as f:
         f.write(dashboard_html)
     print(f"[saved] {filename}")
-    
-    print("Visualization completed successfully.")    # Initialize networks
-    net1 = create_community_network()
-    net2 = create_community_network()
-
-    # Process empty graph case
-    if g.number_of_nodes() == 0:
-        empty_data = {
-            "louvain": {"groups": {}},
-            "hybrid": {"groups": {}}
-        }
-        with open(legend_path, 'w', encoding='utf-8') as f:
-            json.dump(empty_data, f, ensure_ascii=False, indent=2)
-        
-        # Save empty networks and return
-        net1.save_graph(louvain_html)
-        net2.save_graph(hybrid_html)
-        return
         # Build legend HTML for each method
 def build_legend_html(method, community_data):
     """Build enhanced HTML for community legend with detailed information."""
@@ -1649,160 +1544,103 @@ def initialize_community_names():
 
 
 def build_community_visualization(g, partition, network, method="Unknown"):
-    """Build network visualization for a community detection method."""
+    """Build network visualization - uses names from ai_name_community."""
     # Initialize network with graph data
     network.from_nx(g)
     
-    # Find community centers and analyze community structure
+    # Find community centers
     centers = get_community_centers(g, partition)
     communities = defaultdict(list)
     for node, comm_id in partition.items():
         communities[comm_id].append(node)
     
-    # Initialize community labels and info
-    comm_labels = {}  # Maps comm_id to label
-    comm_sizes = {}   # Maps comm_id to size
+    comm_info = {}
     
-    # First pass: Generate meaningful labels for each community
+    # Simple labeling - real names already saved by ai_name_community
     for comm_id, members in communities.items():
         center = centers.get(comm_id)
         if not center:
             continue
-            
-        # Get community texts for analysis
-        neighbors = [n for n in members if n != center]
-        texts = fetch_community_texts_from_file(
-            center, neighbors, filepath="res.json", size=15
-        ) or {}
         
-        # Analyze text patterns for better naming
-        text_content = " ".join([
-            text for node_texts in texts.values() 
-            for text in (node_texts if isinstance(node_texts, list) else [node_texts])
-        ]).lower()
+        # Use center name as label (simple for visualization)
+        label = f"جامعه {center}"
         
-        # Define content categories
-        categories = {
-            "خبری": ["خبر", "گزارش", "اطلاع", "رسان", "منتشر"],
-            "تحلیلی": ["تحلیل", "بررسی", "پژوهش", "مطالعه"],
-            "سیاسی": ["سیاس", "دولت", "مجلس", "حکومت"],
-            "اقتصادی": ["اقتصاد", "بازار", "تورم", "ارز"],
-            "اجتماعی": ["اجتماع", "جامعه", "مردم", "شهروند"],
-            "فرهنگی": ["فرهنگ", "هنر", "ادب", "موسیق"],
-            "ورزشی": ["ورزش", "فوتبال", "بازی", "مسابق"],
-            "علمی": ["علم", "دانش", "فناور", "تکنولوژ"]
+        # Get active members
+        active = sorted(members, key=lambda x: g.degree(x), reverse=True)[:3]
+        
+        comm_info[comm_id] = {
+            'label': label,
+            'size': len(members),
+            'center': center,
+            'members': members,
+            'active': active,
+            'color': None  # Will be assigned below
         }
-        
-        # Determine primary category
-        main_category = None
-        max_matches = 0
-        for category, keywords in categories.items():
-            matches = sum(text_content.count(kw) for kw in keywords)
-            if matches > max_matches:
-                max_matches = matches
-                main_category = category
-                
-        # Determine role/stance
-        roles = {
-            "رسانه": ["خبر", "گزارش", "اطلاع", "پوشش"],
-            "شبکه": ["ارتباط", "انتشار", "اشتراک"],
-            "گروه": ["عضو", "همراه", "فعال"],
-            "جریان": ["حرکت", "پویش", "کمپین"],
-            "فعالان": ["فعال", "مطالبه", "پیگیر", "کنش"],
-            "حامیان": ["حمایت", "پشتیبان", "موافق"],
-            "منتقدان": ["انتقاد", "مخالف", "معترض"]
-        }
-        
-        role = None
-        max_role_matches = 0
-        for r, keywords in roles.items():
-            matches = sum(text_content.count(kw) for kw in keywords)
-            if matches > max_role_matches:
-                max_role_matches = matches
-                role = r
-        
-        # Generate label based on analysis
-        if not main_category:
-            main_category = "مستقل"
-        if not role:
-            role = "رسانه" if "خبر" in text_content else "گروه"
-            
-        # Combine role and category with proper spacing
-        label = f"{role} {main_category}"
-        
-        # Print community naming details
-        print(f"\n=== Community {comm_id} ===")
-        print(f"Center: {center}")
-        print(f"Members: {len(members)}")
-        print(f"Category: {main_category}")
-        print(f"Role: {role}")
-        print(f"Final Label: {label}")
-        print(f"Sample Members: {', '.join(members[:5])}")
-        print("---")
-        
-        # Store community info
-        comm_labels[comm_id] = label
-        comm_sizes[comm_id] = len(members)
     
-    # Generate color scheme
-    sorted_comms = sorted(comm_sizes.items(), key=lambda x: x[1], reverse=True)
+    # Generate colors using golden angle
+    golden_angle = 0.618033988749895
     colors = {}  # Will map labels to colors
     
-    for i, (comm_id, size) in enumerate(sorted_comms):
-        # Use golden ratio for optimal color distribution
-        golden_angle = 0.618033988749895
+    # Sort communities by size
+    sorted_comms = sorted(
+        comm_info.items(),
+        key=lambda x: x[1]['size'],
+        reverse=True
+    )
+    
+    # Assign colors and style nodes
+    for i, (comm_id, info) in enumerate(sorted_comms):
+        # Generate distinct color
         hue = (i * 360 * golden_angle) % 360
-        
-        # Larger communities get more saturated colors
-        saturation = min(75 + (size * 1.5), 90)  # Base 75%, max 90%
-        
-        # Keep lightness balanced for visibility
-        lightness = 60
+        saturation = min(70 + (info['size'] * 1.5), 90)
+        lightness = 55
         
         color = f"hsl({hue},{saturation}%,{lightness}%)"
-        label = comm_labels[comm_id]
-        colors[label] = color
+        info['color'] = color
+        colors[info['label']] = color
         
-        # Apply styling to community nodes
-        for node in communities[comm_id]:
-            is_center = (node == centers[comm_id])
+        # Style community nodes
+        for node in info['members']:
+            is_center = (node == info['center'])
+            is_active = node in info['active']
             
-            # Calculate node size based on degree and role
-            degree = g.degree(node)
+            # Calculate node size
             base_size = 15
-            degree_boost = min(degree * 2, 25)
-            center_boost = 15 if is_center else 0
-            size = base_size + degree_boost + center_boost
+            degree_boost = min(g.degree(node) * 2, 25)
+            role_boost = 15 if is_center else 10 if is_active else 0
+            size = base_size + degree_boost + role_boost
             
-            # Update node properties
+            # Build tooltip
+            roles = []
+            if is_center:
+                roles.append("مرکز جامعه")
+            if is_active:
+                roles.append("عضو فعال")
+                
+            tooltip = f"{node}"
+            if roles:
+                tooltip += f" ({' - '.join(roles)})"
+            tooltip += f"\nجامعه: {info['label']}"
+            
+            # Update node styling
             node_data = network.get_node(node)
             node_data.update({
                 'color': color,
                 'label': node,
-                'title': f"""
-<div style="max-width: 300px; padding: 8px; text-align: right;">
-    <strong style="font-size: 14px; display: block; margin-bottom: 4px;">{node}</strong>
-    <span style="color: #666; font-size: 12px;">گروه: {label}</span>
-</div>
-""",
+                'title': tooltip,
                 'size': size,
                 'borderWidth': 2 if is_center else 1,
                 'borderWidthSelected': 3,
                 'font': {'size': 14, 'face': 'Vazirmatn'}
             })
-            
-            # Add metadata if available
-            if hasattr(g, "graph") and "meta_map" in g.graph:
-                meta = g.graph["meta_map"].get(node)
-                if meta:
-                    node_data["title"] += "<br>" + "<br>".join(
-                        f"{k}: {v}" for k, v in meta.items()
-                    )
     
-    # Optimize layout settings
+    # Optimize network display
     network.options.update({
         "physics": {
-            "stabilization": {"enabled": True, "iterations": 100},
+            "stabilization": {
+                "enabled": True,
+                "iterations": 100
+            },
             "barnesHut": {
                 "gravitationalConstant": -2000,
                 "springConstant": 0.04,
@@ -2288,7 +2126,7 @@ def generate_dashboard_html(louvain_html, hybrid_html, legend_path, utils_js):
 def save_community_name(community_name: str, center_node: str, neighbors: list, 
                        comm_id: int, method: str, time_period: str = None):
     """Save a community name and its details to the community names file."""
-    print(f"[DEBUG] Saving community: {community_name} for {center_node}")
+    print(f"[DEBUG SAVE] Writing: {community_name} (center: {center_node})")
     try:
         with open("community_names.txt", "a", encoding="utf-8") as f:
             f.write("\n" + "=" * 50 + "\n")
@@ -2308,54 +2146,59 @@ def save_community_name(community_name: str, center_node: str, neighbors: list,
         print(f"[error] Failed to write community name: {e}")
 
 
-def fetch_community_texts_from_file(
-    center_node: str,
-    neighbors: list,
-    filepath: str = "res.json",
-    size: int = 15
-) -> Dict[str, List[str]]:
-    """Fetch recent texts for a community from a JSON file.
-    
-    Args:
-        center_node: The central node of the community
-        neighbors: List of neighbor nodes
-        filepath: Path to the JSON file containing texts
-        size: Maximum number of texts to return per user
-        
-    Returns:
-        Dict mapping usernames to their recent texts
-    """
+def fetch_community_texts_from_file(center_node, neighbors, filepath="res.json", size=15):
+    """Fetch texts - fallback to Elasticsearch if file data doesn't match."""
     try:
-        # Get all community members
-        members = [center_node] + neighbors
+        members = set([center_node] + list(neighbors))
         texts_by_member = defaultdict(list)
         
-        # Read texts from file
-        with open(filepath, "r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    msg = json.loads(line)
-                    sender = msg.get("sender")
-                    text = msg.get("text", "").strip()
-                    
-                    # Only collect texts from community members
-                    if sender in members and text:
-                        texts_by_member[sender].append(text)
-                        
-                        # Stop if we have enough texts for this member
-                        if len(texts_by_member[sender]) >= size:
-                            continue
-                            
-                except json.JSONDecodeError:
-                    continue
-                    
-        return {
-            member: texts[:size]
-            for member, texts in texts_by_member.items()
-        }
+        # Try Elasticsearch first (has correct usernames)
+        try:
+            print(f"[DEBUG FETCH] Trying Elasticsearch for {len(members)} members...")
+            es_texts = fetch_community_texts(
+                list(members),
+                max_texts=size
+            )
+            
+            if es_texts:
+                print(f"[DEBUG FETCH] ✓ Elasticsearch: Found texts for {len(es_texts)} members")
+                for member, texts in es_texts.items():
+                    if texts:
+                        texts_by_member[member] = texts[:size]
+                
+                result = dict(texts_by_member)
+                if result:
+                    sample = list(result.keys())[0]
+                    print(f"[DEBUG]   Sample from {sample}: {result[sample][0][:60]}...")
+                return result
+        except Exception as e:
+            print(f"[DEBUG] Elasticsearch not available: {e}")
+        
+        # Fallback: try files (probably won't work but let's try)
+        print(f"[DEBUG] Falling back to file-based lookup...")
+        
+        if os.path.exists("res.json"):
+            with open("res.json", "r", encoding="utf-8") as f:
+                data = json.load(f)
+            
+            for item in data:
+                sender = item.get("user_name")
+                text = (item.get("normalized_text") or item.get("content") or "").strip()
+                
+                if sender in members and text and len(text) > 10:
+                    texts_by_member[sender].append(text)
+        
+        result = {m: texts[:size] for m, texts in texts_by_member.items()}
+        
+        if result:
+            print(f"[DEBUG FETCH] ✓ Files: Found {len(result)} members")
+        else:
+            print(f"[DEBUG FETCH] ✗ No texts found in files or ES")
+        
+        return result
         
     except Exception as e:
-        print(f"[error] reading texts from file: {e}")
+        print(f"[ERROR] fetch failed: {e}")
         return {}
 
 
@@ -2471,11 +2314,39 @@ def generate_time_slots(start_date, end_date, slot_type):
 # --- Timeline Dashboard Generator ---
 import os
 
-def generate_timeline_dashboard(output_file="timeline_dashboard.html"):
+def generate_timeline_dashboard(output_file="timeline_dashboard.html", slot_type="monthly"):
     """
     Generates an interactive dashboard that allows switching between time slot graphs.
     """
-    dashboards = []
+    def parse_slot_range(filename: str):
+        """Extract datetime range from dashboard filename."""
+        try:
+            parts = os.path.splitext(os.path.basename(filename))[0].split("_")
+            start_token = parts[1]
+            end_token = parts[3]
+            start_dt = datetime.strptime(start_token, "%y%m%d")
+            end_dt = datetime.strptime(end_token, "%y%m%d")
+            return start_dt, end_dt
+        except Exception:
+            return None, None
+
+    def legend_html(groups: Dict[str, Any]) -> str:
+        if not groups:
+            return '<div class="legend-item"><span class="label">بدون داده</span></div>'
+        items = []
+        for label, info in groups.items():
+            color = info.get("color", "#999999")
+            count = info.get("count", 0)
+            items.append(
+                f'''<div class="legend-item">
+    <span class="color-box" style="background:{color}"></span>
+    <span class="label">{label}</span>
+    <span class="count">({count} عضو)</span>
+</div>'''
+            )
+        return "\n".join(items)
+
+    dashboards_info = []
     for f in sorted([f for f in os.listdir(".") if f.startswith("dashboard_") and f.endswith(".html") and "_to_" in f]):
         legend_file = f.replace(".html", "_legend.json")
         if not os.path.exists(legend_file):
@@ -2483,9 +2354,10 @@ def generate_timeline_dashboard(output_file="timeline_dashboard.html"):
         try:
             with open(legend_file, "r", encoding="utf-8") as lf:
                 legends = json.load(lf)
-            # skip if no graph + no legends
-            if not legends.get("louvain") and not legends.get("hybrid"):
-                print(f"[skip] {f} has no graph/legends → deleting")
+            louvain_groups = legends.get("louvain", {}).get("groups", {})
+            hybrid_groups = legends.get("hybrid", {}).get("groups", {})
+            if not louvain_groups and not hybrid_groups:
+                print(f"[skip] {f} has empty legends → deleting")
                 try:
                     os.remove(f)
                     if os.path.exists(legend_file):
@@ -2495,57 +2367,74 @@ def generate_timeline_dashboard(output_file="timeline_dashboard.html"):
                 continue
         except Exception:
             continue
-        dashboards.append(f)
+        start_dt, end_dt = parse_slot_range(f)
+        if not start_dt or not end_dt:
+            range_label = "نامشخص"
+        else:
+            range_label = f"{start_dt.strftime('%Y-%m-%d')} تا {end_dt.strftime('%Y-%m-%d')}"
+        dashboards_info.append({"file": f, "range": range_label})
 
-    if not dashboards:
+    if not dashboards_info:
         print("No dashboard_*.html files found.")
         return
 
     # Load legends for each dashboard
     legends = {}
-    for dash in dashboards:
+    for entry in dashboards_info:
+        dash = entry["file"]
         legend_file = dash.replace(".html", "_legend.json")
         if os.path.exists(legend_file):
             with open(legend_file, "r", encoding="utf-8") as f:
                 legends[dash] = json.load(f)
         else:
-            legends[dash] = {"louvain": {}, "hybrid": {}}
+            legends[dash] = {"louvain": {"groups": {}}, "hybrid": {"groups": {}}}
 
     # Generate graph containers HTML
     graph_containers = []
-    for i, dash in enumerate(dashboards):
-        louvain_legend_html = ''.join(
-            f'<span style="color: {str(color)}">{str(label)}</span>'
-            for label, color in legends.get(dash, {}).get("louvain", {}).items()
-        )
-        hybrid_legend_html = ''.join(
-            f'<span style="color: {str(color)}">{str(label)}</span>'
-            for label, color in legends.get(dash, {}).get("hybrid", {}).items()
-        )
-        
+    graph_containers = []
+    slot_ranges = []
+    for i, entry in enumerate(dashboards_info):
+        dash = entry["file"]
+        slot_ranges.append(entry["range"])
+        lou_groups = legends.get(dash, {}).get("louvain", {}).get("groups", {})
+        hyb_groups = legends.get(dash, {}).get("hybrid", {}).get("groups", {})
         container = f'''
-        <div id="container{i}" style="display: none;">
-            <iframe id="frame{i}" src="{dash}" title="{dash}" style="width: 100%; height: 650px; border: none;"></iframe>
+        <div id="container{i}" class="graph-container{' active' if i == 0 else ''}">
+            <iframe id="frame{i}" src="{dash}" title="{dash}"></iframe>
             <div class="legend">
-                <strong>Louvain Community Labels ({dash}):</strong><br>
-                {louvain_legend_html}
+                <strong>الگوریتم لووین ({dash}):</strong>
+                {legend_html(lou_groups)}
             </div>
             <div class="legend">
-                <strong>Hybrid Community Labels ({dash}):</strong><br>
-                {hybrid_legend_html}
+                <strong>روش ترکیبی ({dash}):</strong>
+                {legend_html(hyb_groups)}
             </div>
         </div>
         '''
-        graph_containers.append(container)
+        graph_containers.append(container.strip())
+
+    slot_type_map = {
+        "hourly": "نمایش ساعتی",
+        "daily": "نمایش روزانه",
+        "weekly": "نمایش هفتگی",
+        "monthly": "نمایش ماهانه"
+    }
+    slot_mode_label = slot_type_map.get(slot_type, f"نمایش {slot_type}")
+    dashboards = [entry["file"] for entry in dashboards_info]
 
     # Read template and fill in values
     with open("timeline_template.html", "r", encoding="utf-8") as f:
         template = f.read()
-    
-    # Replace placeholders
-    html = template.replace("{dashboard_list}", json.dumps(dashboards))\
-                  .replace("{graph_containers}", '\n'.join(graph_containers))
-    
+
+    html = (
+        template
+        .replace("{dashboard_list}", json.dumps(dashboards, ensure_ascii=False))
+        .replace("{slot_ranges}", json.dumps(slot_ranges, ensure_ascii=False))
+        .replace("{slot_mode_label}", json.dumps(slot_mode_label, ensure_ascii=False))
+        .replace("{graph_containers}", "\n".join(graph_containers))
+        .replace("{total_slots}", str(len(dashboards)))
+    )
+
     with open(output_file, "w", encoding="utf-8") as f:
         f.write(html)
     print(f"Timeline dashboard saved to {output_file}")
@@ -2560,7 +2449,6 @@ if __name__ == "__main__":
         print("[init] Community names file initialized")
     except Exception as e:
         print(f"[error] Failed to initialize community names file: {e}")
-
     print("[start] Running Louvain and Hybrid community detection...")
     start_date = datetime.strptime("2025-03-01", "%Y-%m-%d")
     end_date = datetime.strptime("2025-07-20", "%Y-%m-%d")
@@ -2608,4 +2496,4 @@ if __name__ == "__main__":
             partition_louvain, partition_hybrid
         )
     print("[done] Community detection completed.")
-    generate_timeline_dashboard()
+    generate_timeline_dashboard(slot_type=slot_type)
