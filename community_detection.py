@@ -1,7 +1,7 @@
 """Community Detection on Sample Social Graph via NetworkX and community-louvain"""
 import re
 import json
-from collections import defaultdict
+from collections import defaultdict, Counter
 import ollama
 import requests
 import os
@@ -12,7 +12,79 @@ import community as community_louvain
 import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.decomposition import PCA
+from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score, silhouette_score
 from node2vec import Node2Vec
+from cleanup_root import clean_project_root
+
+# ---- Echo Chamber Metrics ----
+
+def compute_ei_index(g, community_nodes):
+    """
+    E-I Index = (E - I) / (E + I)
+    E: edges from community to outside
+    I: edges within community
+    Range: [-1, +1]
+    """
+    internal_edges = 0
+    external_edges = 0
+    community_set = set(community_nodes)
+
+    for u in community_nodes:
+        for v in g.neighbors(u):
+            if v in community_set:
+                internal_edges += 1
+            else:
+                external_edges += 1
+
+    # each internal edge counted twice
+    internal_edges /= 2
+    total = internal_edges + external_edges
+    if total == 0:
+        return 0.0
+    return (external_edges - internal_edges) / total
+
+
+def compute_conductance(g, community_nodes):
+    """
+    Conductance = cut(S, V-S) / min(vol(S), vol(V-S))
+    Lower value => more isolated community
+    """
+    community_set = set(community_nodes)
+    cut_edges = 0
+    vol_s = 0
+    vol_rest = 0
+
+    for u in g.nodes():
+        deg_u = g.degree(u)
+        if u in community_set:
+            vol_s += deg_u
+            for v in g.neighbors(u):
+                if v not in community_set:
+                    cut_edges += 1
+        else:
+            vol_rest += deg_u
+
+    denom = min(vol_s, vol_rest)
+    if denom == 0:
+        return 0.0
+    return cut_edges / denom
+
+
+def compute_temporal_stability(prev_partition, curr_partition):
+    """
+    Compute AMI and NMI between two partitions
+    """
+    common_nodes = set(prev_partition.keys()) & set(curr_partition.keys())
+    if len(common_nodes) < 2:
+        return {"AMI": None, "NMI": None}
+
+    prev_labels = [prev_partition[n] for n in common_nodes]
+    curr_labels = [curr_partition[n] for n in common_nodes]
+
+    return {
+        "AMI": adjusted_rand_score(prev_labels, curr_labels),
+        "NMI": normalized_mutual_info_score(prev_labels, curr_labels)
+    }
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 from elastic import es, INDEX, log as es_log
@@ -85,6 +157,316 @@ def fetch_community_texts(accounts: List[str], start_date: str = None,
 
 
 _ai_name_cache = {}
+META_FIELDS = {
+    "political_label": "گرایش سیاسی",
+    "category": "موضوع",
+    "emotion": "احساس",
+    "sentiment": "حس",
+    "language": "زبان"
+}
+
+STANCE_TARGETS = {
+    "رهبری": ["رهبری", "رهبر", "خامنه", "khamenei", "khamenei_ir"]
+}
+
+SENTIMENT_MAP = {
+    "positive": "pos",
+    "pos": "pos",
+    "مثبت": "pos",
+    "negative": "neg",
+    "neg": "neg",
+    "منفی": "neg",
+    "neutral": "neu",
+    "neu": "neu",
+    "خنثی": "neu",
+    "مختلط": "neu"
+}
+
+POS_CUES = [
+    "حامی", "حمایت", "زنده باد", "درود", "قهرمان", "افتخار",
+    "عالی", "خوب", "مثبت", "درست", "حق", "همراهی"
+]
+
+NEG_CUES = [
+    "مرگ بر", "لعنت", "نفرت", "ننگ", "خائن", "دیکتاتور",
+    "بد", "افتضاح", "فاسد", "کثیف", "منفور", "مجرم",
+    "محاکمه", "اعدام", "اعتراض"
+]
+
+
+def iter_res_documents(file_path="res.json"):
+    """Yield docs from res.json (supports JSON array or JSON lines)."""
+    if not os.path.exists(file_path):
+        return
+    with open(file_path, "r", encoding="utf-8") as f:
+        first_char = None
+        while first_char is None:
+            ch = f.read(1)
+            if not ch:
+                break
+            if not ch.isspace():
+                first_char = ch
+        f.seek(0)
+        if first_char == "[":
+            try:
+                data = json.load(f)
+            except json.JSONDecodeError:
+                data = []
+            if isinstance(data, list):
+                for doc in data:
+                    if isinstance(doc, dict):
+                        yield doc
+        else:
+            for line in f:
+                try:
+                    doc = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(doc, dict):
+                    yield doc
+
+
+def normalize_sentiment(value):
+    """Normalize sentiment labels to pos/neg/neu."""
+    if not value:
+        return None
+    return SENTIMENT_MAP.get(str(value).strip().lower())
+
+
+def infer_sentiment_from_text(text):
+    """Lightweight lexicon-based sentiment inference."""
+    if not text:
+        return None
+    lower_text = str(text).lower()
+    pos_hits = sum(1 for cue in POS_CUES if cue in lower_text)
+    neg_hits = sum(1 for cue in NEG_CUES if cue in lower_text)
+    if pos_hits == 0 and neg_hits == 0:
+        return "neu"
+    if pos_hits > neg_hits:
+        return "pos"
+    if neg_hits > pos_hits:
+        return "neg"
+    return "neu"
+
+
+def load_user_context(file_path="res.json"):
+    """Load user-level metadata and stance signals from res.json."""
+    if not os.path.exists(file_path):
+        print(f"[meta] {file_path} not found; skipping metadata load.")
+        return {}, {}
+
+    meta_counts = defaultdict(lambda: {field: Counter() for field in META_FIELDS})
+    stance_map = defaultdict(lambda: defaultdict(Counter))
+    for doc in iter_res_documents(file_path):
+        username = doc.get("user_name") or doc.get("sender")
+        if not username:
+            continue
+        for field in META_FIELDS:
+            value = doc.get(field)
+            if value:
+                val_norm = str(value).strip()
+                if val_norm.lower() in {"unknown", "نامشخص", "none", "null"}:
+                    continue
+                meta_counts[username][field][val_norm] += 1
+
+        text = doc.get("normalized_text") or doc.get("content") or ""
+        sentiment_raw = doc.get("sentiment") or doc.get("sentiment.label")
+        sentiment = normalize_sentiment(sentiment_raw)
+        if not sentiment:
+            sentiment = infer_sentiment_from_text(text)
+        if text and sentiment:
+            stance_map[username]["__topic__"][sentiment] += 1
+            lower_text = str(text).lower()
+            for target, keywords in STANCE_TARGETS.items():
+                if any(k.lower() in lower_text for k in keywords):
+                    stance_map[username][target][sentiment] += 1
+
+    meta_map = {}
+    for username, counts in meta_counts.items():
+        meta_map[username] = {
+            field: (counter.most_common(1)[0][0] if counter else None)
+            for field, counter in counts.items()
+        }
+
+    print(f"[meta] Loaded metadata for {len(meta_map)} users.")
+    return meta_map, stance_map
+
+
+def attach_metadata_to_graph(g, meta_map, stance_map=None, topic_label=None):
+    """Attach metadata to graph for tooltip and community analysis."""
+    if not meta_map and not stance_map:
+        return
+    if meta_map:
+        g.graph["meta_map"] = meta_map
+    for node in g.nodes():
+        meta = meta_map.get(node)
+        if meta:
+            g.nodes[node]["meta"] = meta
+    if stance_map:
+        g.graph["stance_map"] = stance_map
+    if topic_label:
+        g.graph["topic_label"] = topic_label
+
+
+def aggregate_community_metadata(members, meta_map):
+    """Aggregate metadata for a community and return summary + counts."""
+    field_counts = {field: Counter() for field in META_FIELDS}
+    for member in members:
+        meta = meta_map.get(member, {})
+        for field in META_FIELDS:
+            value = meta.get(field)
+            if value:
+                field_counts[field][value] += 1
+
+    summary = {
+        field: (counter.most_common(1)[0][0] if counter else None)
+        for field, counter in field_counts.items()
+    }
+    return summary, field_counts
+
+
+def format_meta_summary(summary):
+    """Format metadata summary for tooltips/legend."""
+    parts = []
+    stance = summary.get("stance")
+    if isinstance(stance, dict):
+        target = stance.get("target")
+        stance_label = stance.get("stance")
+        if stance_label:
+            if target:
+                parts.append(f"موضع نسبت به {target}: {stance_label}")
+            else:
+                parts.append(f"موضع: {stance_label}")
+    for field, label in META_FIELDS.items():
+        value = summary.get(field)
+        if value:
+            parts.append(f"{label}: {value}")
+    return " | ".join(parts)
+
+
+def detect_target_from_label(label):
+    """Detect stance target based on label keywords."""
+    if not label:
+        return None
+    for target, keywords in STANCE_TARGETS.items():
+        if any(k in label for k in keywords):
+            return target
+    return None
+
+
+def compute_community_stance(label, members, stance_map, topic_label=None):
+    """Compute stance summary for a community."""
+    if not stance_map:
+        return None
+    target = detect_target_from_label(label)
+    target_key = target or "__topic__"
+    counts = Counter()
+    for member in members:
+        counts.update(stance_map.get(member, {}).get(target_key, Counter()))
+    total = sum(counts.values())
+    if total == 0:
+        return None
+    pos = counts.get("pos", 0)
+    neg = counts.get("neg", 0)
+    neu = counts.get("neu", 0)
+    if neu / total >= 0.7:
+        stance = "بی‌جهت‌گیری"
+    elif pos / total >= 0.6:
+        stance = "حامی"
+    elif neg / total >= 0.6:
+        stance = "منتقد"
+    else:
+        stance = "ترکیبی"
+    return {
+        "target": target or topic_label,
+        "stance": stance,
+        "counts": {"pos": pos, "neg": neg, "neu": neu, "total": total}
+    }
+
+
+def compute_community_similarity(community_summaries):
+    """Compute pairwise similarity (Jaccard) from summary labels."""
+    comm_ids = list(community_summaries.keys())
+    signatures = {}
+    for comm_id in comm_ids:
+        signature = set()
+        for field in META_FIELDS:
+            value = community_summaries[comm_id].get(field)
+            if value:
+                signature.add((field, value))
+        signatures[comm_id] = signature
+
+    edges = []
+    for i in range(len(comm_ids)):
+        for j in range(i + 1, len(comm_ids)):
+            a = comm_ids[i]
+            b = comm_ids[j]
+            sig_a = signatures[a]
+            sig_b = signatures[b]
+            union = sig_a | sig_b
+            if not union:
+                continue
+            similarity = len(sig_a & sig_b) / len(union)
+            if similarity <= 0:
+                continue
+            edges.append({
+                "source": a,
+                "target": b,
+                "similarity": similarity,
+                "distance": 1 - similarity
+            })
+    return edges
+
+
+def load_topic_label_from_elastic(file_path="elastic.py"):
+    """Extract topic query from elastic.py multi_match query."""
+    if not os.path.exists(file_path):
+        return None
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        match = re.search(
+            r'"multi_match"\s*:\s*\{[^}]*?"query"\s*:\s*"([^"]+)"',
+            content,
+            re.S
+        )
+        if not match:
+            match = re.search(
+                r"'multi_match'\s*:\s*\{[^}]*?'query'\s*:\s*'([^']+)'",
+                content,
+                re.S
+            )
+        if match:
+            return match.group(1).strip()
+    except Exception:
+        return None
+    return None
+
+
+def apply_edge_widths(net, g, min_width=0.5, max_width=6.0):
+    """Scale edge widths by interaction weights."""
+    if not hasattr(net, "edges"):
+        return
+    weights = []
+    for edge in net.edges:
+        data = g.get_edge_data(edge.get("from"), edge.get("to"), default={})
+        weight = data.get("weight", 1)
+        edge["weight"] = weight
+        weights.append(weight)
+
+    if not weights:
+        return
+    min_weight = min(weights)
+    max_weight = max(weights)
+
+    for edge in net.edges:
+        weight = edge.get("weight", 1)
+        if max_weight == min_weight:
+            width = min_width
+        else:
+            width = min_width + (weight - min_weight) * (max_width - min_width) / (max_weight - min_weight)
+        edge["width"] = width
+        edge["title"] = f"وزن تعامل: {weight}"
 
 
 # --- Detect company LLM
@@ -375,7 +757,7 @@ def save_communities(communities, filename=None):
         
         # Save with proper encoding and formatting
         with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            json.dump(sanitize_json(data), f, ensure_ascii=False, indent=2)
             
         print(f"Saved {len(communities_list)} communities to {filename}")
         return True
@@ -671,6 +1053,7 @@ def visualize_graph_interactively(
     
     # Add the graph after options are set
     net.from_nx(g)
+    apply_edge_widths(net, g)
 
     # Optional: color nodes by community/cluster
     if partition:
@@ -863,6 +1246,108 @@ def run_kmeans(embeddings, n_clusters=5):
     return kmeans.fit_predict(embeddings)
 
 
+def summarize_partition_sizes(partition):
+    """Summarize community sizes for a partition dict."""
+    if not partition:
+        return {"num_clusters": 0, "total_nodes": 0, "sizes": []}
+    counts = Counter(partition.values())
+    sizes = sorted(counts.values(), reverse=True)
+    arr = np.array(sizes, dtype=float)
+    return {
+        "num_clusters": len(sizes),
+        "total_nodes": int(arr.sum()),
+        "min_size": int(arr.min()),
+        "max_size": int(arr.max()),
+        "mean_size": float(arr.mean()),
+        "median_size": float(np.median(arr)),
+        "sizes": sizes
+    }
+
+
+def compute_modularity_safe(g, partition):
+    """Compute modularity with guardrails."""
+    if not partition or g.number_of_edges() == 0:
+        return None
+    try:
+        return float(community_louvain.modularity(partition, g, weight="weight"))
+    except Exception:
+        return None
+
+
+def build_hybrid_report(g, embeddings, nodes, hybrid_labels, louvain_partition=None,
+                        start_date=None, end_date=None):
+    """Build a comparable report for hybrid vs Louvain partitions."""
+    hybrid_partition = {node: int(hybrid_labels[i]) for i, node in enumerate(nodes)}
+    report = {
+        "timeframe": {"start": start_date, "end": end_date},
+        "hybrid": {
+            "size_summary": summarize_partition_sizes(hybrid_partition),
+            "modularity": compute_modularity_safe(g, hybrid_partition)
+        }
+    }
+
+    # Community-level echo chamber metrics
+    communities = defaultdict(list)
+    for node, cid in hybrid_partition.items():
+        communities[cid].append(node)
+
+    echo_metrics = {}
+    for cid, members in communities.items():
+        echo_metrics[cid] = {
+            "ei_index": compute_ei_index(g, members),
+            "conductance": compute_conductance(g, members),
+            "size": len(members)
+        }
+
+    report["hybrid"]["echo_metrics"] = echo_metrics
+
+    # Silhouette score (embedding quality proxy)
+    unique_labels = set(hybrid_labels)
+    if len(unique_labels) > 1 and len(embeddings) > 1:
+        try:
+            report["hybrid"]["silhouette"] = float(silhouette_score(embeddings, hybrid_labels))
+        except Exception:
+            report["hybrid"]["silhouette"] = None
+    else:
+        report["hybrid"]["silhouette"] = None
+
+    if louvain_partition:
+        report["louvain"] = {
+            "size_summary": summarize_partition_sizes(louvain_partition),
+            "modularity": compute_modularity_safe(g, louvain_partition)
+        }
+        # Compare partitions on shared nodes
+        louvain_labels = [louvain_partition.get(node) for node in nodes]
+        if all(label is not None for label in louvain_labels):
+            try:
+                report["comparison"] = {
+                    "nmi": float(normalized_mutual_info_score(louvain_labels, hybrid_labels)),
+                    "ari": float(adjusted_rand_score(louvain_labels, hybrid_labels))
+                }
+            except Exception:
+                report["comparison"] = {"nmi": None, "ari": None}
+            # Temporal stability proxy (same window, different methods)
+            report["comparison"]["stability"] = {
+                "AMI": report["comparison"]["ari"],
+                "NMI": report["comparison"]["nmi"]
+            }
+
+    return report
+
+
+def save_hybrid_report(report, output_dir="communities"):
+    """Persist hybrid report to JSON."""
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    start = report.get("timeframe", {}).get("start", "unknown")
+    end = report.get("timeframe", {}).get("end", "unknown")
+    filename = f"{output_dir}/hybrid_report_{start}_to_{end}_{timestamp}.json"
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(sanitize_json(report), f, ensure_ascii=False, indent=2)
+    print(f"[saved] {filename}")
+    return filename
+
+
 def main_hybrid(g, ax):
     """
     Using Node2Vec and KMeans for community detection.
@@ -914,6 +1399,9 @@ def style_partition(g, net, partition, method, base_hue):
     if g.number_of_nodes() == 0 or not partition:
         return {}
 
+    meta_map = g.graph.get("meta_map", {})
+    stance_map = g.graph.get("stance_map", {})
+    topic_label = g.graph.get("topic_label")
     centers = get_community_centers(g, partition)
     communities = []
     for comm_id, center in centers.items():
@@ -926,13 +1414,23 @@ def style_partition(g, net, partition, method, base_hue):
             label = ai_name_community(center, neighbors, NODE_LABEL_MAP, comm_id, method, g=g)
         if not label:
             label = NODE_LABEL_MAP.get(center, f"گروه {comm_id}")
+        stance_info = compute_community_stance(label, members, stance_map, topic_label=topic_label)
+        if stance_info:
+            if "حامیان" in label and stance_info["stance"] == "منتقد":
+                label = label.replace("حامیان", "منتقدان")
+            elif "حامیان" in label and stance_info["stance"] == "ترکیبی":
+                label = label.replace("حامیان", "بحث درباره")
         for node in members:
             g.nodes[node]["community_label"] = label
+        summary, _ = aggregate_community_metadata(members, meta_map)
+        if stance_info:
+            summary["stance"] = stance_info
         communities.append({
             "id": comm_id,
             "label": label,
             "center": center,
-            "members": members
+            "members": members,
+            "summary": summary
         })
 
     if not communities:
@@ -957,10 +1455,14 @@ def style_partition(g, net, partition, method, base_hue):
             degree_boost = min(g.degree(node) * 2, 25)
             role_boost = 15 if node == community["center"] else 0
             size = 15 + degree_boost + role_boost
+            meta_summary = format_meta_summary(community.get("summary", {}))
+            title = f"{node}<br>جامعه: {display_label}"
+            if meta_summary:
+                title = f"{title}<br>{meta_summary}"
             node_data.update({
                 "color": color,
                 "label": node,
-                "title": f"{node}\nجامعه: {display_label}",
+                "title": title,
                 "size": size,
                 "shape": "dot",
                 "borderWidth": 2 if node == community["center"] else 1,
@@ -971,10 +1473,87 @@ def style_partition(g, net, partition, method, base_hue):
 
         legend_map[display_label] = {
             "color": color,
-            "count": len(community["members"])
+            "count": len(community["members"]),
+            "meta": community.get("summary", {})
         }
 
+    apply_edge_widths(net, g)
     return legend_map
+
+
+def save_community_similarity_graph(g, partition, method, base_filename):
+    """Generate a community-level similarity graph from metadata summaries."""
+    meta_map = g.graph.get("meta_map", {})
+    if not meta_map or not partition:
+        return None
+
+    communities = defaultdict(list)
+    for node, comm_id in partition.items():
+        communities[comm_id].append(node)
+
+    summaries = {}
+    labels = {}
+    for comm_id, members in communities.items():
+        summary, _ = aggregate_community_metadata(members, meta_map)
+        summaries[comm_id] = summary
+        label = None
+        for member in members:
+            label = g.nodes[member].get("community_label")
+            if label:
+                break
+        labels[comm_id] = label or f"گروه {comm_id}"
+
+    edges = compute_community_similarity(summaries)
+    if not edges:
+        return None
+
+    output_html = base_filename.replace("dashboard_", f"{method}_similarity_")
+    output_json = output_html.replace(".html", ".json")
+
+    net = Network(
+        height="600px",
+        width="100%",
+        notebook=False,
+        bgcolor="#ffffff",
+        font_color="#333333"
+    )
+    net.options = {
+        "physics": {
+            "enabled": True,
+            "stabilization": {"enabled": True, "iterations": 100}
+        },
+        "edges": {"color": "#7f8c8d"},
+        "interaction": {"hover": True}
+    }
+
+    for comm_id, members in communities.items():
+        label = labels.get(comm_id, f"گروه {comm_id}")
+        summary_text = format_meta_summary(summaries.get(comm_id, {}))
+        title = f"{label}<br>اندازه: {len(members)}"
+        if summary_text:
+            title = f"{title}<br>{summary_text}"
+        net.add_node(
+            str(comm_id),
+            label=label,
+            title=title,
+            size=15 + min(len(members), 30)
+        )
+
+    for edge in edges:
+        width = 1 + edge["similarity"] * 6
+        title = f"شباهت: {edge['similarity']:.2f} | فاصله: {edge['distance']:.2f}"
+        net.add_edge(
+            str(edge["source"]),
+            str(edge["target"]),
+            width=width,
+            title=title
+        )
+
+    net.save_graph(output_html)
+    with open(output_json, "w", encoding="utf-8") as f:
+        json.dump(sanitize_json(edges), f, ensure_ascii=False, indent=2)
+    print(f"[saved] {output_html}, {output_json}")
+    return output_html
 
 
 # ---- Helper: Visualize or Dummy ----
@@ -1011,6 +1590,17 @@ def numpy_to_python(obj):
     elif isinstance(obj, (np.ndarray,)):
         return obj.tolist()
     return obj
+
+
+def sanitize_json(obj):
+    """Recursively convert numpy/scalar types for JSON serialization."""
+    if isinstance(obj, dict):
+        return {str(k): sanitize_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [sanitize_json(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [sanitize_json(v) for v in obj]
+    return numpy_to_python(obj)
 
 
 def write_summary_file(communities, start_date, end_date):
@@ -1127,7 +1717,7 @@ def visualize_or_dummy(slot_start, slot_end, g, louvain=None, hybrid=None):
             }
             
             with open(output_path, "w", encoding="utf-8") as f:
-                json.dump(communities_data, f, ensure_ascii=False, indent=2)
+                json.dump(sanitize_json(communities_data), f, ensure_ascii=False, indent=2)
             print(f"[saved] {output_path}")
 
         # Create base legend data
@@ -1143,7 +1733,7 @@ def visualize_or_dummy(slot_start, slot_end, g, louvain=None, hybrid=None):
         }
 
         with open(legend_path, 'w', encoding='utf-8') as f:
-            json.dump(legend_data, f, ensure_ascii=False, indent=2)
+            json.dump(sanitize_json(legend_data), f, ensure_ascii=False, indent=2)
         
         # Visualize the graph
         visualize_combined_dashboard(
@@ -1158,7 +1748,7 @@ def visualize_or_dummy(slot_start, slot_end, g, louvain=None, hybrid=None):
         with open(filename, 'w', encoding='utf-8') as f:
             f.write("<html><body>Error generating visualization</body></html>")
         with open(legend_path, 'w', encoding='utf-8') as f:
-            json.dump(legend_data, f)
+            json.dump(sanitize_json(legend_data), f)
 
 
 # ---- Combined Dashboard Visualization ----
@@ -1236,6 +1826,10 @@ def visualize_combined_dashboard(g, louvain_partition, hybrid_partition, filenam
     net2.save_graph(hybrid_html)
     print(f"[saved] {louvain_html}, {hybrid_html}")
 
+    # Save community-level similarity graphs based on metadata summaries
+    save_community_similarity_graph(g, louvain_partition, "louvain", filename)
+    save_community_similarity_graph(g, hybrid_partition, "hybrid", filename)
+
     legend_data = {
         "louvain": {"groups": louvain_colors},
         "hybrid": {"groups": hybrid_colors}
@@ -1249,7 +1843,7 @@ def visualize_combined_dashboard(g, louvain_partition, hybrid_partition, filenam
         pass
 
     with open(legend_path, 'w', encoding='utf-8') as f:
-        json.dump(legend_data, f, ensure_ascii=False, indent=2)
+        json.dump(sanitize_json(legend_data), f, ensure_ascii=False, indent=2)
     print(f"[saved] {legend_path}")
 
     # read utils and generate dashboard
@@ -1547,6 +2141,7 @@ def build_community_visualization(g, partition, network, method="Unknown"):
     """Build network visualization - uses names from ai_name_community."""
     # Initialize network with graph data
     network.from_nx(g)
+    apply_edge_widths(network, g)
     
     # Find community centers
     centers = get_community_centers(g, partition)
@@ -1589,6 +2184,9 @@ def build_community_visualization(g, partition, network, method="Unknown"):
     )
     
     # Assign colors and style nodes
+    meta_map = g.graph.get("meta_map", {})
+    stance_map = g.graph.get("stance_map", {})
+    topic_label = g.graph.get("topic_label")
     for i, (comm_id, info) in enumerate(sorted_comms):
         # Generate distinct color
         hue = (i * 360 * golden_angle) % 360
@@ -1600,6 +2198,11 @@ def build_community_visualization(g, partition, network, method="Unknown"):
         colors[info['label']] = color
         
         # Style community nodes
+        summary, _ = aggregate_community_metadata(info["members"], meta_map)
+        stance_info = compute_community_stance(info["label"], info["members"], stance_map, topic_label=topic_label)
+        if stance_info:
+            summary["stance"] = stance_info
+        meta_summary = format_meta_summary(summary)
         for node in info['members']:
             is_center = (node == info['center'])
             is_active = node in info['active']
@@ -1621,6 +2224,8 @@ def build_community_visualization(g, partition, network, method="Unknown"):
             if roles:
                 tooltip += f" ({' - '.join(roles)})"
             tooltip += f"\nجامعه: {info['label']}"
+            if meta_summary:
+                tooltip += f"\n{meta_summary}"
             
             # Update node styling
             node_data = network.get_node(node)
@@ -1746,6 +2351,13 @@ def generate_dashboard_html(louvain_html, hybrid_html, legend_path, utils_js):
             font-size: 12px;
             margin-right: 8px;
         }
+        .meta {
+            display: block;
+            width: 100%;
+            font-size: 12px;
+            color: #6c757d;
+            margin-right: 24px;
+        }
         @media (max-width: 1200px) {
             .container {
                 grid-template-columns: 1fr;
@@ -1761,14 +2373,52 @@ def generate_dashboard_html(louvain_html, hybrid_html, legend_path, utils_js):
             try {{
                 const response = await fetch("{legend_path}");
                 const data = await response.json();
+
+                const metaLabels = {{
+                    political_label: "گرایش سیاسی",
+                    category: "موضوع",
+                    emotion: "احساس",
+                    sentiment: "حس",
+                    language: "زبان"
+                }};
+
+                function formatMeta(meta) {{
+                    if (!meta) return '';
+                    const parts = [];
+                    if (meta.stance) {{
+                        if (typeof meta.stance === 'object') {{
+                            const target = meta.stance.target;
+                            const stance = meta.stance.stance;
+                            if (stance) {{
+                                parts.push(
+                                    target
+                                        ? `موضع نسبت به ${{target}}: ${{stance}}`
+                                        : `موضع: ${{stance}}`
+                                );
+                            }}
+                        }} else {{
+                            parts.push(`موضع: ${{meta.stance}}`);
+                        }}
+                    }}
+                    for (const [key, label] of Object.entries(metaLabels)) {{
+                        if (meta[key]) {{
+                            parts.push(`${{label}}: ${{meta[key]}}`);
+                        }}
+                    }}
+                    return parts.join(' | ');
+                }}
                 
                 function buildLegendHTML(groups) {{
                     const items = Object.entries(groups).map(([label, info]) => 
-                        `<div class="legend-item">
+                        (function() {{
+                            const meta = info.meta ? formatMeta(info.meta) : '';
+                            return `<div class="legend-item">
                         <span class="color-box" style="background:${{info.color}}"></span>
                         <span class="label">${{label}}</span>
                         <span class="count">(${{info.count}} عضو)</span>
-                        </div>`
+                        ${{meta ? `<span class="meta">${{meta}}</span>` : ''}}
+                        </div>`;
+                        }})()
                     );
                     return `<div class="legend-grid">${{items.join('')}}</div>`;
                 }}
@@ -1932,11 +2582,13 @@ def generate_dashboard_html(louvain_html, hybrid_html, legend_path, utils_js):
                 function buildLegendHTML(groups) {
                     let html = ['<div class="legend-grid">'];
                     for (let [label, info] of Object.entries(groups)) {
+                        const meta = info.meta ? formatMeta(info.meta) : '';
                         html.push(`
                             <div class="legend-item">
                                 <span class="color-box" style="background:${info.color}"></span>
                                 <span class="label">${label}</span>
                                 <span class="count">(${info.count} عضو)</span>
+                                ${meta ? `<span class="meta">${meta}</span>` : ''}
                             </div>
                         `);
                     }
@@ -2241,7 +2893,7 @@ def process_visualization(g, louvain_partition, hybrid_partition, filename):
 
     # Save legend data
     with open(legend_path, 'w', encoding='utf-8') as f:
-        json.dump(legend_data, f, ensure_ascii=False, indent=2)
+        json.dump(sanitize_json(legend_data), f, ensure_ascii=False, indent=2)
     print(f"[saved] {legend_path}")
 
     # Generate dashboard HTML
@@ -2289,7 +2941,7 @@ def process_visualization(g, louvain_partition, hybrid_partition, filename):
     }
     
     with open(legend_path, "w", encoding="utf-8") as f:
-        json.dump(legend_data, f, indent=2, ensure_ascii=False)
+        json.dump(sanitize_json(legend_data), f, indent=2, ensure_ascii=False)
     print(f"[legend regenerated] {legend_path}")
     print(f"Combined dashboard saved to {filename}")
 
@@ -2314,7 +2966,7 @@ def generate_time_slots(start_date, end_date, slot_type):
 # --- Timeline Dashboard Generator ---
 import os
 
-def generate_timeline_dashboard(output_file="timeline_dashboard.html", slot_type="monthly"):
+def generate_timeline_dashboard(output_file="timeline_dashboard.html", slot_type="monthly", topic_label=None):
     """
     Generates an interactive dashboard that allows switching between time slot graphs.
     """
@@ -2335,13 +2987,20 @@ def generate_timeline_dashboard(output_file="timeline_dashboard.html", slot_type
             return '<div class="legend-item"><span class="label">بدون داده</span></div>'
         items = []
         for label, info in groups.items():
-            color = info.get("color", "#999999")
-            count = info.get("count", 0)
+            if isinstance(info, dict):
+                color = info.get("color", "#999999")
+                count = info.get("count", 0)
+                meta_summary = format_meta_summary(info.get("meta", {}))
+            else:
+                color = "#999999"
+                count = info if isinstance(info, int) else 0
+                meta_summary = ""
             items.append(
                 f'''<div class="legend-item">
     <span class="color-box" style="background:{color}"></span>
     <span class="label">{label}</span>
     <span class="count">({count} عضو)</span>
+    {f'<span class="meta">{meta_summary}</span>' if meta_summary else ''}
 </div>'''
             )
         return "\n".join(items)
@@ -2401,13 +3060,19 @@ def generate_timeline_dashboard(output_file="timeline_dashboard.html", slot_type
         container = f'''
         <div id="container{i}" class="graph-container{' active' if i == 0 else ''}">
             <iframe id="frame{i}" src="{dash}" title="{dash}"></iframe>
-            <div class="legend">
-                <strong>الگوریتم لووین ({dash}):</strong>
-                {legend_html(lou_groups)}
+            <div class="nav-buttons">
+                <button class="btn-prev" onclick="navigate(-1)">▶ قبلی</button>
+                <button class="btn-next" onclick="navigate(1)">بعدی ◀</button>
             </div>
-            <div class="legend">
-                <strong>روش ترکیبی ({dash}):</strong>
-                {legend_html(hyb_groups)}
+            <div class="legend-row">
+                <div class="legend">
+                    <strong>الگوریتم لووین ({dash}):</strong>
+                    {legend_html(lou_groups)}
+                </div>
+                <div class="legend">
+                    <strong>روش ترکیبی ({dash}):</strong>
+                    {legend_html(hyb_groups)}
+                </div>
             </div>
         </div>
         '''
@@ -2421,6 +3086,8 @@ def generate_timeline_dashboard(output_file="timeline_dashboard.html", slot_type
     }
     slot_mode_label = slot_type_map.get(slot_type, f"نمایش {slot_type}")
     dashboards = [entry["file"] for entry in dashboards_info]
+    if topic_label is None:
+        topic_label = load_topic_label_from_elastic() or "#همکاری_ملی"
 
     # Read template and fill in values
     with open("timeline_template.html", "r", encoding="utf-8") as f:
@@ -2432,6 +3099,7 @@ def generate_timeline_dashboard(output_file="timeline_dashboard.html", slot_type
         .replace("{slot_ranges}", json.dumps(slot_ranges, ensure_ascii=False))
         .replace("{slot_mode_label}", json.dumps(slot_mode_label, ensure_ascii=False))
         .replace("{graph_containers}", "\n".join(graph_containers))
+        .replace("{topic_label}", topic_label)
         .replace("{total_slots}", str(len(dashboards)))
     )
 
@@ -2442,6 +3110,9 @@ def generate_timeline_dashboard(output_file="timeline_dashboard.html", slot_type
 
 # Print community results
 if __name__ == "__main__":
+    removed = clean_project_root()
+    if removed:
+        print(f"[cleanup] Removed {len(removed)} generated artifacts from project root.")
     # پاکسازی فایل اسامی در شروع برنامه
     try:
         with open("community_names.txt", "w", encoding="utf-8") as f:
@@ -2450,8 +3121,10 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[error] Failed to initialize community names file: {e}")
     print("[start] Running Louvain and Hybrid community detection...")
-    start_date = datetime.strptime("2025-03-01", "%Y-%m-%d")
-    end_date = datetime.strptime("2025-07-20", "%Y-%m-%d")
+    meta_map, stance_map = load_user_context()
+    topic_label = load_topic_label_from_elastic() or "#همکاری_ملی"
+    start_date = datetime.strptime("2025-12-06", "%Y-%m-%d")
+    end_date = datetime.strptime("2025-12-21", "%Y-%m-%d")
     delta_days = (end_date - start_date).days
     if delta_days <= 7:
         slot_type = "daily"
@@ -2483,6 +3156,7 @@ if __name__ == "__main__":
             continue
         g_slot = build_user_graph(messages)
         g_slot = clean_graph(g_slot)
+        attach_metadata_to_graph(g_slot, meta_map, stance_map, topic_label=topic_label)
         if g_slot.number_of_nodes() == 0:
             print("[skip] Empty graph after filtering")
             visualize_or_dummy(slot_start, slot_end, g_slot)
@@ -2491,9 +3165,19 @@ if __name__ == "__main__":
         embeddings, nodes = get_node_embeddings(g_slot)
         labels = run_kmeans(embeddings, n_clusters=5)
         partition_hybrid = {node: labels[i] for i, node in enumerate(nodes)}
+        report = build_hybrid_report(
+            g_slot,
+            embeddings,
+            nodes,
+            labels,
+            louvain_partition=partition_louvain,
+            start_date=slot_start.strftime("%Y-%m-%d"),
+            end_date=slot_end.strftime("%Y-%m-%d")
+        )
+        save_hybrid_report(report)
         visualize_or_dummy(
             slot_start, slot_end, g_slot,
             partition_louvain, partition_hybrid
         )
     print("[done] Community detection completed.")
-    generate_timeline_dashboard(slot_type=slot_type)
+    generate_timeline_dashboard(slot_type=slot_type, topic_label=topic_label)

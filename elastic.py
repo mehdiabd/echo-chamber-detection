@@ -90,8 +90,11 @@ query_body = {
         "bool": {
             "must": [
                 {
-                    "terms": {
-                        "entity.hashtag": ["#همکاری_ملی"]
+                    "multi_match": {
+                        "query": "علیکردی",
+                        "fields": ["normalized_text", "content"],
+                        "type": "best_fields",
+                        "operator": "and"
                     }
                 }
             ],
@@ -99,8 +102,9 @@ query_body = {
                 {
                     "range": {
                         "date": {
-                            "gte": "now-270d/d",
-                            "lte": "now/d"
+                            "gte": "2025-12-06",
+                            "lte": "2025-12-21",
+                            "format": "yyyy-MM-dd"
                         }
                     }
                 }
@@ -108,9 +112,9 @@ query_body = {
         }
     },
     "_source": [
-        "user_name",           # ← This is what community_texts.py queries
-        "normalized_text",     # ← This is the tweet content
-        "content",             # ← Fallback content
+        "user_name",
+        "normalized_text",
+        "content",
         "user_title",
         "political_category.label",
         "date",
@@ -118,21 +122,7 @@ query_body = {
         "entity.mention",
         "category.label",
         "emotion.label",
-        "entity.hashtag",
-        "language.label",
-        "ner.event",
-        "ner.location",
-        "ner.nationality",
-        "ner.organ",
-        "ner.person",
-        "ner.politic_group",
-        "offensive.label",
-        "sentiment.label",
-        "reply_to_user",
-        "quote",
-        "repost"
-    ],
-
+    ]
 }
 
 type_counter = Counter()
