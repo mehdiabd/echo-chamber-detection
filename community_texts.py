@@ -3,10 +3,10 @@ Fetch top or recent tweets for a community's nodes from Elasticsearch.
 """
 
 import json
-from elastic import es
+from elastic_client import es, INDEX
 
 
-def fetch_recent_tweets(username, index="twitter_temp_data", size=5):
+def fetch_recent_tweets(username, index=INDEX, size=5):
     """
     Fetch most recent tweets for a given username.
     :param username: str - account handle
@@ -37,7 +37,7 @@ def fetch_recent_tweets(username, index="twitter_temp_data", size=5):
         return []
 
 
-def fetch_community_texts(center_node, neighbors, index="twitter_temp_data", size=5):
+def fetch_community_texts(center_node, neighbors, index=INDEX, size=5):
     """
     Fetch top or most recent tweets for a community's center node and its neighbors
     from Elasticsearch. Prefers normalized_text if available.

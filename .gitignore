@@ -34,6 +34,8 @@ __pycache__/
 # data files
 *.pdf
 *.txt
+*.csv
+*.numbers
 
 # logs
 *.log

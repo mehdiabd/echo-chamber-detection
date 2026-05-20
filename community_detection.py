@@ -2,8 +2,6 @@
 import re
 import json
 from collections import defaultdict, Counter
-import ollama
-import requests
 import os
 from typing import Dict, Any, List
 from pyvis.network import Network
@@ -15,6 +13,7 @@ from sklearn.decomposition import PCA
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score, silhouette_score
 from node2vec import Node2Vec
 from cleanup_root import clean_project_root
+from llm_client import call_local_llama, call_org_llm
 
 # ---- Echo Chamber Metrics ----
 
@@ -70,6 +69,46 @@ def compute_conductance(g, community_nodes):
     return cut_edges / denom
 
 
+DEFAULT_ECHO_THRESHOLDS = {
+    # Structural isolation
+    "ei_index_max": -0.2,   # lower (more negative) => more internal ties
+    "conductance_max": 0.3, # lower => more isolated
+    # Content homogeneity
+    "homogeneity_min": 0.6, # dominant stance share
+    # Size guardrail
+    "min_size": 5,
+}
+
+
+def compute_content_homogeneity(stance_info):
+    """Return dominant stance share based on stance_info counts."""
+    if not stance_info:
+        return None
+    counts = stance_info.get("counts") or {}
+    total = counts.get("total", 0) or 0
+    if total <= 0:
+        return None
+    return max(counts.get("pos", 0), counts.get("neg", 0), counts.get("neu", 0)) / total
+
+
+def classify_echo_chamber(ei_index, conductance, homogeneity, size, thresholds=None):
+    """Classify echo chamber based on structural + content thresholds."""
+    th = dict(DEFAULT_ECHO_THRESHOLDS)
+    if thresholds:
+        th.update(thresholds)
+    if size is None or size < th["min_size"]:
+        return False
+    if ei_index is None or conductance is None:
+        return False
+    if ei_index > th["ei_index_max"]:
+        return False
+    if conductance > th["conductance_max"]:
+        return False
+    if homogeneity is None or homogeneity < th["homogeneity_min"]:
+        return False
+    return True
+
+
 def compute_temporal_stability(prev_partition, curr_partition):
     """
     Compute AMI and NMI between two partitions
@@ -87,7 +126,7 @@ def compute_temporal_stability(prev_partition, curr_partition):
     }
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
-from elastic import es, INDEX, log as es_log
+from elastic_client import es, INDEX
 from elasticsearch.helpers import scan
 
 
@@ -341,6 +380,20 @@ def format_meta_summary(summary):
         value = summary.get(field)
         if value:
             parts.append(f"{label}: {value}")
+    echo = summary.get("echo")
+    if isinstance(echo, dict):
+        is_echo = echo.get("is_echo_chamber")
+        if is_echo is not None:
+            parts.append(f"اتاق پژواک: {'بله' if is_echo else 'خیر'}")
+        ei_index = echo.get("ei_index")
+        if isinstance(ei_index, (int, float)):
+            parts.append(f"E-I: {ei_index:.2f}")
+        conductance = echo.get("conductance")
+        if isinstance(conductance, (int, float)):
+            parts.append(f"هدایت: {conductance:.2f}")
+        homogeneity = echo.get("content_homogeneity")
+        if isinstance(homogeneity, (int, float)):
+            parts.append(f"همگنی: {homogeneity:.2f}")
     return " | ".join(parts)
 
 
@@ -443,6 +496,14 @@ def load_topic_label_from_elastic(file_path="elastic.py"):
     return None
 
 
+def resolve_topic_label(default="#همکاری_ملی"):
+    """Resolve topic label from env override, then elastic.py, then default."""
+    override = (os.getenv("TOPIC_LABEL_OVERRIDE") or "").strip()
+    if override:
+        return override
+    return load_topic_label_from_elastic() or default
+
+
 def apply_edge_widths(net, g, min_width=0.5, max_width=6.0):
     """Scale edge widths by interaction weights."""
     if not hasattr(net, "edges"):
@@ -467,74 +528,6 @@ def apply_edge_widths(net, g, min_width=0.5, max_width=6.0):
             width = min_width + (weight - min_weight) * (max_width - min_width) / (max_weight - min_weight)
         edge["width"] = width
         edge["title"] = f"وزن تعامل: {weight}"
-
-
-# --- Detect company LLM
-try:
-    resp = requests.get("http://192.168.59.239:8002/v1/models", timeout=5)
-    ORG_LLM_MODEL = resp.json()["data"][0]["id"]
-    ORG_LLM_URL = "http://192.168.59.239:8002/v1/chat/completions"
-    print(f"[Org LLM] Running model: {ORG_LLM_MODEL}")
-except Exception as e:
-    ORG_LLM_MODEL = None
-    ORG_LLM_URL = None
-    print(f"[Org LLM] Not available → {e}")
-
-
-def call_llm(prompt: str, backend="org", temperature: float = 0.6, max_tokens: int = 60):
-    """
-    Generic LLM caller with temperature control.
-    backend: "org" or "local_llama"
-    temperature: creativity control (0.0 - 1.0)
-    """
-    if backend == "org":
-        if not ORG_LLM_MODEL or not ORG_LLM_URL:
-            return None
-        try:
-            payload = {
-                "model": ORG_LLM_MODEL,
-                "messages": [
-                    {"role": "system", "content": "شما یک متخصص در نام‌گذاری جوامع و گروه‌های اجتماعی هستید."},
-                    {"role": "user", "content": prompt}
-                ],
-                "temperature": temperature,
-                "max_tokens": max_tokens
-            }
-            resp = requests.post(ORG_LLM_URL, json=payload, timeout=30)
-            data = resp.json()
-            # defensive path for different response shapes
-            if isinstance(data, dict) and "choices" in data:
-                return data["choices"][0]["message"]["content"].strip()
-            if isinstance(data, dict) and "result" in data:
-                return data["result"].strip()
-            return None
-        except Exception as e:
-            print(f"[Org LLM] Failed → {e}")
-            return None
-    elif backend == "local_llama":
-        try:
-            response = ollama.chat(
-                model="llama3.1",
-                messages=[
-                    {"role": "system", "content": "تو یک متخصص در نام‌گذاری جوامع و گروه‌های اجتماعی هستی."},
-                    {"role": "user", "content": prompt}
-                ],
-                options={"temperature": temperature, "num_predict": max_tokens}
-            )
-            return response['message']['content'].strip()
-        except Exception as e:
-            print(f"[Local Llama] Failed → {e}")
-            return None
-    else:
-        raise ValueError(f"Unknown backend: {backend}")
-
-
-def call_local_llama(prompt: str, temperature: float = 0.5):
-    return call_llm(prompt, backend="local_llama", temperature=temperature, max_tokens=60)
-
-
-def call_org_llm(prompt: str, temperature: float = 0.75):
-    return call_llm(prompt, backend="org", temperature=temperature, max_tokens=80)
 
 
 # --- Helper: Extract recent texts from Elasticsearch or file ---
@@ -832,10 +825,27 @@ def analyze_community_texts(texts, members):
     return matched_themes[0] if matched_themes else None
 
 
+def build_community_naming_prompt(context: str, few_shot: str) -> str:
+    """Build the canonical prompt used by naming backends."""
+    examples_block = few_shot.strip() if few_shot else "(no examples available)"
+    context_block = context.strip() if context.strip() else "(no context available)"
+    return f"""
+You are a professional analyst in social network analysis. Provide a single, concise Persian community name (max 3-4 words) that reflects the community's dominant theme or role. Avoid usernames and any extraneous punctuation. Return only the label text.
+
+Examples:
+{examples_block}
+
+Context (sample tweets):
+{context_block}
+
+Answer (label only):
+"""
+
+
 def ai_name_community(center_node, neighbors, node_label_map, comm_id, method, time_period=None, g=None):
     """
     Naming pipeline using tweets and strict LLM priority:
-      1) Company LLM (creative)
+      1) Organization LLM (creative)
       2) Local LLM (conservative)
       3) NODE_LABEL_MAP (dictionary)
       4) Final fallback: 'ناشناس'
@@ -844,10 +854,10 @@ def ai_name_community(center_node, neighbors, node_label_map, comm_id, method, t
     g.nodes[node]['community_label'] when a graph object `g` is provided.
     """
     try:
-        # 1. Try dictionary quickly (but still attempt LLMs for creativity unless dict is explicit)
+        # Keep dictionary label only as fallback after LLM queue.
         dict_label = node_label_map.get(center_node)
 
-        # 2. Fetch live texts for center + up to 3 top neighbors
+        # Fetch live texts for center + up to 3 top neighbors.
         sample_neighbors = neighbors[:3] if neighbors else []
         nodes = [center_node] + sample_neighbors
         texts_map = fetch_community_texts(nodes, max_texts=6)
@@ -863,40 +873,30 @@ def ai_name_community(center_node, neighbors, node_label_map, comm_id, method, t
         # Load few-shot examples for style guidance
         few_shot = load_few_shot_examples(2)
 
-        prompt = f"""
-You are a professional analyst in social network analysis. Provide a single, concise Persian community name (max 3-4 words) that reflects the community's dominant theme or role. Avoid usernames and any extraneous punctuation. Return only the label text.
-
-Examples:
-{few_shot}
-
-Context (sample tweets):
-{context}
-
-Answer (label only):
-"""
+        naming_prompt = build_community_naming_prompt(context=context, few_shot=few_shot)
 
         candidate = None
 
-        # 3. Try company LLM (higher creativity)
+        # 1) Try organization LLM first.
         try:
-            candidate = call_org_llm(prompt, temperature=0.75)
+            candidate = call_org_llm(naming_prompt, temperature=0.75)
         except Exception:
             candidate = None
 
-        # 4. If org LLM fails or returns invalid output, try local LLM (more conservative)
+        # 2) If org LLM fails or returns invalid output, try local LLM.
         if not candidate or not is_valid_label(clean_label(candidate, default=None)):
             try:
-                candidate_local = call_local_llama(prompt, temperature=0.5)
+                candidate_local = call_local_llama(naming_prompt, temperature=0.5)
                 if candidate_local and is_valid_label(clean_label(candidate_local, default=None)):
                     candidate = candidate_local
             except Exception:
                 pass
 
-        # 5. If still no candidate, fall back to dictionary label
+        # 3) If still no candidate, fall back to dictionary label.
         if not candidate:
             candidate = dict_label
 
-        # 6. Clean and final validation
+        # 4) Final fallback remains "ناشناس" after cleanup/validation.
         final_label = clean_label(candidate, default="ناشناس")
         if not is_valid_label(final_label):
             final_label = "ناشناس"
@@ -1186,8 +1186,15 @@ def get_node_embeddings(g, dimensions=64):
     """
     Generate Node2Vec embeddings for the graph.
     """
+    workers_env = (os.getenv("NODE2VEC_WORKERS") or "").strip()
+    try:
+        workers = int(workers_env) if workers_env else 1
+    except ValueError:
+        workers = 1
+    if workers < 1:
+        workers = 1
     node2vec = Node2Vec(g, dimensions=dimensions, walk_length=20, num_walks=100,
-                        workers=2)
+                        workers=workers)
     model = node2vec.fit(window=10, min_count=1)
 
     # Ensure embeddings are generated for all nodes
@@ -1229,6 +1236,36 @@ def load_interactions(file_path="interactions.json"):
                 continue
     print(f"Loaded {len(messages)} interactions.")
     return messages
+
+
+def get_interactions_date_range(file_path="interactions.json"):
+    """Return min/max datetime from interactions.json date fields."""
+    min_dt = None
+    max_dt = None
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                date_val = msg.get("date")
+                if not date_val:
+                    continue
+                date_str = str(date_val)[:10]
+                if len(date_str) != 10:
+                    continue
+                try:
+                    dt = datetime.strptime(date_str, "%Y-%m-%d")
+                except Exception:
+                    continue
+                if min_dt is None or dt < min_dt:
+                    min_dt = dt
+                if max_dt is None or dt > max_dt:
+                    max_dt = dt
+    except FileNotFoundError:
+        return None, None
+    return min_dt, max_dt
 
 
 # Glue It All Together
@@ -1274,8 +1311,88 @@ def compute_modularity_safe(g, partition):
         return None
 
 
+def compute_echo_metrics(g, partition, stance_map=None, topic_label=None, thresholds=None):
+    """Compute echo chamber metrics for a partition."""
+    communities = defaultdict(list)
+    for node, cid in partition.items():
+        communities[cid].append(node)
+
+    echo_metrics = {}
+    for cid, members in communities.items():
+        stance_info = None
+        if stance_map:
+            stance_info = compute_community_stance(None, members, stance_map, topic_label=topic_label)
+        homogeneity = compute_content_homogeneity(stance_info)
+        ei_index = compute_ei_index(g, members)
+        conductance = compute_conductance(g, members)
+        echo_metrics[cid] = {
+            "ei_index": ei_index,
+            "conductance": conductance,
+            "content_homogeneity": homogeneity,
+            "size": len(members),
+            "is_echo_chamber": classify_echo_chamber(
+                ei_index, conductance, homogeneity, len(members), thresholds=thresholds
+            ),
+        }
+        if stance_info:
+            echo_metrics[cid]["stance"] = stance_info
+
+    return echo_metrics
+
+
+def summarize_echo_metrics(echo_metrics, thresholds=None):
+    """Print summary stats for echo metrics vs thresholds."""
+    th = dict(DEFAULT_ECHO_THRESHOLDS)
+    if thresholds:
+        th.update(thresholds)
+    total = len(echo_metrics)
+    if total == 0:
+        print("[echo] No communities to summarize.")
+        return
+    counts = {
+        "size_ok": 0,
+        "ei_ok": 0,
+        "conductance_ok": 0,
+        "homogeneity_ok": 0,
+        "all_ok": 0,
+        "homogeneity_missing": 0,
+    }
+    for info in echo_metrics.values():
+        size = info.get("size", 0)
+        ei = info.get("ei_index")
+        conductance = info.get("conductance")
+        homogeneity = info.get("content_homogeneity")
+        size_ok = size >= th["min_size"]
+        ei_ok = ei is not None and ei <= th["ei_index_max"]
+        conductance_ok = conductance is not None and conductance <= th["conductance_max"]
+        if homogeneity is None:
+            counts["homogeneity_missing"] += 1
+        homogeneity_ok = homogeneity is not None and homogeneity >= th["homogeneity_min"]
+        if size_ok:
+            counts["size_ok"] += 1
+        if ei_ok:
+            counts["ei_ok"] += 1
+        if conductance_ok:
+            counts["conductance_ok"] += 1
+        if homogeneity_ok:
+            counts["homogeneity_ok"] += 1
+        if size_ok and ei_ok and conductance_ok and homogeneity_ok:
+            counts["all_ok"] += 1
+    print(
+        "[echo] Summary:",
+        f"total={total},",
+        f"size_ok={counts['size_ok']},",
+        f"ei_ok={counts['ei_ok']},",
+        f"conductance_ok={counts['conductance_ok']},",
+        f"homogeneity_ok={counts['homogeneity_ok']},",
+        f"homogeneity_missing={counts['homogeneity_missing']},",
+        f"echo_true={counts['all_ok']}"
+    )
+
+
 def build_hybrid_report(g, embeddings, nodes, hybrid_labels, louvain_partition=None,
-                        start_date=None, end_date=None):
+                        start_date=None, end_date=None, stance_map=None,
+                        topic_label=None, thresholds=None):
     """Build a comparable report for hybrid vs Louvain partitions."""
     hybrid_partition = {node: int(hybrid_labels[i]) for i, node in enumerate(nodes)}
     report = {
@@ -1286,20 +1403,14 @@ def build_hybrid_report(g, embeddings, nodes, hybrid_labels, louvain_partition=N
         }
     }
 
-    # Community-level echo chamber metrics
-    communities = defaultdict(list)
-    for node, cid in hybrid_partition.items():
-        communities[cid].append(node)
-
-    echo_metrics = {}
-    for cid, members in communities.items():
-        echo_metrics[cid] = {
-            "ei_index": compute_ei_index(g, members),
-            "conductance": compute_conductance(g, members),
-            "size": len(members)
-        }
-
-    report["hybrid"]["echo_metrics"] = echo_metrics
+    report["hybrid"]["echo_metrics"] = compute_echo_metrics(
+        g,
+        hybrid_partition,
+        stance_map=stance_map,
+        topic_label=topic_label,
+        thresholds=thresholds,
+    )
+    report["hybrid"]["echo_thresholds"] = dict(DEFAULT_ECHO_THRESHOLDS, **(thresholds or {}))
 
     # Silhouette score (embedding quality proxy)
     unique_labels = set(hybrid_labels)
@@ -1316,6 +1427,14 @@ def build_hybrid_report(g, embeddings, nodes, hybrid_labels, louvain_partition=N
             "size_summary": summarize_partition_sizes(louvain_partition),
             "modularity": compute_modularity_safe(g, louvain_partition)
         }
+        report["louvain"]["echo_metrics"] = compute_echo_metrics(
+            g,
+            louvain_partition,
+            stance_map=stance_map,
+            topic_label=topic_label,
+            thresholds=thresholds,
+        )
+        report["louvain"]["echo_thresholds"] = dict(DEFAULT_ECHO_THRESHOLDS, **(thresholds or {}))
         # Compare partitions on shared nodes
         louvain_labels = [louvain_partition.get(node) for node in nodes]
         if all(label is not None for label in louvain_labels):
@@ -1402,6 +1521,12 @@ def style_partition(g, net, partition, method, base_hue):
     meta_map = g.graph.get("meta_map", {})
     stance_map = g.graph.get("stance_map", {})
     topic_label = g.graph.get("topic_label")
+    echo_by_comm = compute_echo_metrics(
+        g,
+        partition,
+        stance_map=stance_map,
+        topic_label=topic_label,
+    )
     centers = get_community_centers(g, partition)
     communities = []
     for comm_id, center in centers.items():
@@ -1425,6 +1550,14 @@ def style_partition(g, net, partition, method, base_hue):
         summary, _ = aggregate_community_metadata(members, meta_map)
         if stance_info:
             summary["stance"] = stance_info
+        echo_info = echo_by_comm.get(comm_id)
+        if isinstance(echo_info, dict):
+            summary["echo"] = {
+                "is_echo_chamber": echo_info.get("is_echo_chamber"),
+                "ei_index": echo_info.get("ei_index"),
+                "conductance": echo_info.get("conductance"),
+                "content_homogeneity": echo_info.get("content_homogeneity"),
+            }
         communities.append({
             "id": comm_id,
             "label": label,
@@ -2405,6 +2538,21 @@ def generate_dashboard_html(louvain_html, hybrid_html, legend_path, utils_js):
                             parts.push(`${{label}}: ${{meta[key]}}`);
                         }}
                     }}
+                    if (meta.echo) {{
+                        const echo = meta.echo;
+                        if (echo.is_echo_chamber !== undefined && echo.is_echo_chamber !== null) {{
+                            parts.push(`اتاق پژواک: ${{echo.is_echo_chamber ? "بله" : "خیر"}}`);
+                        }}
+                        if (typeof echo.ei_index === "number") {{
+                            parts.push(`E-I: ${{echo.ei_index.toFixed(2)}}`);
+                        }}
+                        if (typeof echo.conductance === "number") {{
+                            parts.push(`هدایت: ${{echo.conductance.toFixed(2)}}`);
+                        }}
+                        if (typeof echo.content_homogeneity === "number") {{
+                            parts.push(`همگنی: ${{echo.content_homogeneity.toFixed(2)}}`);
+                        }}
+                    }}
                     return parts.join(' | ');
                 }}
                 
@@ -3122,9 +3270,15 @@ if __name__ == "__main__":
         print(f"[error] Failed to initialize community names file: {e}")
     print("[start] Running Louvain and Hybrid community detection...")
     meta_map, stance_map = load_user_context()
-    topic_label = load_topic_label_from_elastic() or "#همکاری_ملی"
-    start_date = datetime.strptime("2025-12-06", "%Y-%m-%d")
-    end_date = datetime.strptime("2025-12-21", "%Y-%m-%d")
+    topic_label = resolve_topic_label("#همکاری_ملی")
+    all_messages = load_interactions()
+    start_date, end_date = get_interactions_date_range()
+    if not start_date or not end_date:
+        print("[config] interactions.json has no valid dates; using last 10 days.")
+        end_date = datetime.utcnow()
+        start_date = end_date - timedelta(days=10)
+    else:
+        print(f"[config] Using interactions date range: {start_date.date()} to {end_date.date()}")
     delta_days = (end_date - start_date).days
     if delta_days <= 7:
         slot_type = "daily"
@@ -3138,7 +3292,6 @@ if __name__ == "__main__":
         _ai_name_cache.clear()
         print(f"\n[slot {idx+1}/{len(slots)}] Processing: {slot_start.date()} to {slot_end.date()}...")
         messages = []
-        all_messages = load_interactions()
         for msg in all_messages:
             date_str = msg.get("date")
             if not date_str:
@@ -3172,8 +3325,14 @@ if __name__ == "__main__":
             labels,
             louvain_partition=partition_louvain,
             start_date=slot_start.strftime("%Y-%m-%d"),
-            end_date=slot_end.strftime("%Y-%m-%d")
+            end_date=slot_end.strftime("%Y-%m-%d"),
+            stance_map=stance_map,
+            topic_label=topic_label,
         )
+        # Print echo metrics summary for diagnostics
+        summarize_echo_metrics(report["hybrid"].get("echo_metrics", {}))
+        if "louvain" in report:
+            summarize_echo_metrics(report["louvain"].get("echo_metrics", {}))
         save_hybrid_report(report)
         visualize_or_dummy(
             slot_start, slot_end, g_slot,
