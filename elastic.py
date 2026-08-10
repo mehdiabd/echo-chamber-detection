@@ -3,6 +3,7 @@ import os
 import sys
 import subprocess
 import json
+from datetime import datetime, timedelta
 from elasticsearch import Elasticsearch
 from elasticsearch.helpers import scan
 from collections import Counter
@@ -290,10 +291,25 @@ query_body = {
         "normalized_text",
         "text",
         "content",
+        "text",
+        "comment",
+        "keywords",
         "user_title",
         "political_category.label",
         "date",
+        "timestamp",
+        "crawl_date",
         "type",
+        "reply_to_user",
+        "reply_to",
+        "in_reply_to_user",
+        "in_reply_to_screen_name",
+        "reply",
+        "quote",
+        "repost",
+        "retweet",
+        "retweeted_status",
+        "quoted_status",
         "entity.mention",
         "entity.hashtag",
         "reply",
@@ -332,8 +348,106 @@ log.info(
 
 type_counter = Counter()
 
+def _extract_user(obj):
+    if not obj:
+        return None
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, dict):
+        for key in ("user_name", "username", "screen_name", "user_id"):
+            if obj.get(key):
+                return obj.get(key)
+        user = obj.get("user")
+        if isinstance(user, dict):
+            for key in ("user_name", "username", "screen_name", "user_id"):
+                if user.get(key):
+                    return user.get(key)
+    return None
+
+def _log_count(label, query):
+    try:
+        res = es.count(index=INDEX, body={"query": query})
+        log.warning(f"[count] {label}: {res.get('count')}")
+    except Exception as e:
+        log.warning(f"[count] {label} failed: {e}")
+
+# Diagnostics: check whether data exists in date range and whether query filters too hard
+try:
+    date_only_query = {"range": {"date": {"gte": start_date, "lte": end_date, "format": "yyyy-MM-dd"}}}
+    _log_count("date_only", date_only_query)
+    _log_count("query_only", query_body["query"]["bool"]["must"][0])
+    _log_count("query_and_date", query_body["query"])
+    # Index min/max date for alignment
+    try:
+        min_date = es.search(
+            index=INDEX,
+            body={"sort": [{"date": "asc"}], "_source": ["date"], "size": 1}
+        )
+        max_date = es.search(
+            index=INDEX,
+            body={"sort": [{"date": "desc"}], "_source": ["date"], "size": 1}
+        )
+        min_hit = (min_date.get("hits", {}).get("hits") or [{}])[0].get("_source", {})
+        max_hit = (max_date.get("hits", {}).get("hits") or [{}])[0].get("_source", {})
+        min_val = str(min_hit.get("date", ""))[:10]
+        max_val = str(max_hit.get("date", ""))[:10]
+        if min_val and max_val:
+            log.warning(f"[date_range] index min={min_val} max={max_val}")
+    except Exception as e:
+        log.warning(f"[date_range] failed: {e}")
+    # Simple term test to confirm field matches
+    test_term = "ایران"
+    test_query = {
+        "simple_query_string": {
+            "query": test_term,
+            "fields": ["normalized_text", "text"],
+            "default_operator": "OR",
+            "flags": "OR|AND|NOT|PHRASE|PRECEDENCE",
+            "lenient": True,
+        }
+    }
+    _log_count("test_term_only", test_query)
+    # Sample one doc to inspect available fields
+    try:
+        sample = es.search(index=INDEX, body={"query": {"match_all": {}}, "size": 1})
+        hits = sample.get("hits", {}).get("hits", [])
+        if hits:
+            src = hits[0].get("_source", {})
+            log.warning(f"[sample] keys: {sorted(src.keys())[:30]}")
+            for k in ["normalized_text", "content", "text", "date", "type"]:
+                if k in src:
+                    val = src.get(k)
+                    if isinstance(val, str):
+                        log.warning(f"[sample] {k}: {val[:200]}")
+                    else:
+                        log.warning(f"[sample] {k}: {type(val).__name__}")
+        else:
+            log.warning("[sample] no hits for match_all")
+    except Exception as e:
+        log.warning(f"[sample] failed: {e}")
+    # Sample docs with non-empty content-like fields
+    for field in ["normalized_text", "text", "comment", "keywords", "content"]:
+        try:
+            sample_q = {"query": {"exists": {"field": field}}, "size": 1}
+            sample = es.search(index=INDEX, body=sample_q)
+            hits = sample.get("hits", {}).get("hits", [])
+            if not hits:
+                continue
+            src = hits[0].get("_source", {})
+            val = src.get(field)
+            if isinstance(val, str) and val.strip():
+                log.warning(f"[sample_nonempty] {field}: {val[:200]}")
+                break
+            if isinstance(val, list) and val:
+                log.warning(f"[sample_nonempty] {field}: {str(val[:5])}")
+                break
+        except Exception:
+            continue
+except Exception as e:
+    log.warning(f"[count] diagnostics skipped: {e}")
+
 log.info("Starting initial scan query...")
-result = scan(
+primary_scan = scan(
     es,
     index=INDEX,
     query=query_body,
@@ -366,7 +480,7 @@ log.info(f"TWEET TYPE COUNTS IN SCAN 1: {dict(type_counter)}")
 
 # Rewind and re-scan to collect interactions
 log.info("Starting scan to collect interactions...")
-result = scan(
+interaction_scan = scan(
     es,
     index=INDEX,
     query=query_body,
@@ -483,8 +597,8 @@ with open("interactions.json", "w", encoding="utf-8") as f_interactions:
                     if target and not same_user(target, sender):
                         interaction = {
                             "sender": sender,
-                            "target": target,
-                            "type": "mention",
+                            "target": retweeted_user,
+                            "type": "repost",
                             "date": date_str
                         }
                         log.info(f"Writing interaction: {interaction}")
@@ -492,10 +606,54 @@ with open("interactions.json", "w", encoding="utf-8") as f_interactions:
                         f_interactions.write("\n")
                         interaction_usernames.add(target)
                         written += 1
-            else:
-                # Only warn once for missing mentions
-                # log.warning("⛔ Skipped post: No mentions found (entity or text).")
-                continue
+
+            elif tweet_type == "post":
+                # log.warning("🟡 Processing a POST tweet...")
+                mentions = source.get("entity", {}).get("mention", [])
+                normalized_mentions = []
+                if isinstance(mentions, list):
+                    for mention in mentions:
+                        if isinstance(mention, str):
+                            normalized_mentions.append(mention)
+                        elif isinstance(mention, dict):
+                            name = (
+                                mention.get("user_name")
+                                or mention.get("username")
+                                or mention.get("screen_name")
+                                or mention.get("name")
+                            )
+                            if name:
+                                normalized_mentions.append(name)
+                text_blob = source.get("normalized_text") or source.get("content") or ""
+                if normalized_mentions:
+                    mentions = normalized_mentions
+                else:
+                    mentions = extract_mentions(text_blob)
+                    # log.warning(f"🔍 Mentions found after fallback: {mentions}")
+
+                if mentions:
+                    for mention in mentions:
+                        target = mention
+                        if target and target != sender:
+                            interaction = {
+                                "sender": sender,
+                                "target": target,
+                                "type": "mention",
+                                "date": date_str
+                            }
+                            log.info(f"Writing interaction: {interaction}")
+                            json.dump(interaction, f_interactions, ensure_ascii=False)
+                            f_interactions.write("\n")
+                            written += 1
+                else:
+                    # Only warn once for missing mentions
+                    # log.warning("⛔ Skipped post: No mentions found (entity or text).")
+                    continue
+finally:
+    try:
+        interaction_scan.close()
+    except Exception:
+        pass
 
 log.warning(f"✅ TOTAL INTERACTIONS WRITTEN: {written}")
 log.info("Extracted interactions written to interactions.json")
@@ -615,10 +773,5 @@ with open("res.json", "r", encoding="utf-8") as f:
     for line in preview:
         print(line.strip())
 
-# Automatically call normalize_json.py
-cur_path = os.path.dirname(__file__)
-normalize_script = os.path.join(cur_path, "normalize_json.py")
-subprocess.run(["python3", normalize_script], check=True)
-log.info("Normalization complete.")
 log.info("All steps completed successfully.")
 log.info("Finished full pipeline.")
