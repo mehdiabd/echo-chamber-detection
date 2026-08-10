@@ -9,6 +9,14 @@ from elasticsearch.helpers import scan
 from collections import Counter
 import logging
 import re
+from datetime import datetime
+
+from elastic_query import (
+    DEFAULT_LOOKBACK_DAYS,
+    build_topic_clause,
+    parse_topic_terms,
+    resolve_date_range,
+)
 
 # Set up logging to both console and file
 log = logging.getLogger(__name__)
@@ -32,6 +40,154 @@ log.addHandler(console_handler)
 def extract_mentions(text):
     return re.findall(r"@(\w+)", text or "")
 
+
+def normalize_tweet_type(value):
+    normalized = str(value or "").strip().lower()
+    if normalized in {"quote", "qoute", "quoted"}:
+        return "quote"
+    if normalized in {"repost", "retweet", "re-tweet", "rt"}:
+        return "repost"
+    if normalized in {"post", "tweet", "original"}:
+        return "post"
+    return normalized
+
+
+def same_user(left, right):
+    return bool(left and right and left.casefold() == right.casefold())
+
+
+DEFAULT_TOPIC_LABEL = "جنگ جمهوری اسلامی و آمریکا"
+PIPELINE_CONFIG_PATH = "pipeline_config.json"
+
+DEFAULT_WAR_TOPIC_TERMS = [
+    "#جنگ_ایران_آمریکا",
+    "#جنگ_ایران_و_آمریکا",
+    "#ایران_آمریکا",
+    "#حمله_آمریکا",
+    "#حمله_به_ایران",
+    "#حمله_به_فردو",
+    "#جنگ_۱۲_روزه",
+    "#جنگ_دوازده_روزه",
+    "#تنگه_هرمز",
+    "#پایگاه_العدید",
+    "جنگ ایران آمریکا",
+    "جنگ ایران و آمریکا",
+    "جنگ جمهوری اسلامی آمریکا",
+    "جنگ جمهوری اسلامی و آمریکا",
+    "حمله آمریکا به ایران",
+    "حمله آمریکا",
+    "حمله به ایران",
+    "حمله به فردو",
+    "حمله به نطنز",
+    "حمله به اصفهان",
+    "تاسیسات هسته‌ای ایران",
+    "تاسیسات هسته ای ایران",
+    "فردو",
+    "نطنز",
+    "اصفهان",
+    "پایگاه العدید",
+    "العدید",
+    "تنگه هرمز",
+    "عملیات چکش نیمه شب",
+    "چکش نیمه شب",
+    "Midnight Hammer",
+    "Operation Midnight Hammer",
+    "Fordow",
+    "Natanz",
+    "Isfahan",
+    "Al Udeid",
+    "Strait of Hormuz",
+]
+
+
+def select_slot_modes(start, end):
+    days = (end - start).days + 1
+    if days <= 8:
+        return ["daily", "hourly"]
+    if days <= 45:
+        return ["weekly", "daily"]
+    if days <= 90:
+        return ["monthly", "weekly", "daily"]
+    if days <= 180:
+        return ["monthly", "weekly"]
+    return ["quarterly", "monthly", "weekly"]
+
+
+def get_nested_value(data, *path):
+    current = data
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def first_text_value(*values):
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def normalize_user_handle(value):
+    if isinstance(value, dict):
+        value = first_text_value(
+            value.get("user_name"),
+            value.get("username"),
+            value.get("screen_name"),
+            value.get("name"),
+        )
+    if not isinstance(value, str):
+        return None
+    handle = value.strip()
+    while handle.startswith("@"):
+        handle = handle[1:].strip()
+    return handle or None
+
+
+def get_reply_target(source):
+    reply = source.get("reply")
+    return normalize_user_handle(
+        first_text_value(
+            source.get("reply_to_user"),
+            source.get("in_reply_to_user"),
+            source.get("in_reply_to_screen_name"),
+            get_nested_value(source, "reply_to", "user_name"),
+            get_nested_value(source, "reply_to", "user", "user_name"),
+            get_nested_value(reply, "user_name"),
+            get_nested_value(reply, "user", "user_name"),
+        )
+    )
+
+
+def get_quote_target(source):
+    quote = source.get("quote")
+    quoted_status = source.get("quoted_status")
+    return normalize_user_handle(
+        first_text_value(
+            get_nested_value(quote, "user", "user_name"),
+            get_nested_value(quote, "user_name"),
+            get_nested_value(quoted_status, "user", "user_name"),
+            get_nested_value(quoted_status, "user_name"),
+        )
+    )
+
+
+def get_repost_target(source):
+    repost = source.get("repost")
+    retweet = source.get("retweet")
+    retweeted_status = source.get("retweeted_status")
+    return normalize_user_handle(
+        first_text_value(
+            get_nested_value(repost, "user", "user_name"),
+            get_nested_value(repost, "user_name"),
+            get_nested_value(retweet, "user", "user_name"),
+            get_nested_value(retweet, "user_name"),
+            get_nested_value(retweeted_status, "user", "user_name"),
+            get_nested_value(retweeted_status, "user_name"),
+        )
+    )
+
 # Prompt the user to select the authentication type
 # print("Select the Elasticsearch server (authentication type):")
 # print("1. Production Elasticsearch server (API Key Authentication)")
@@ -42,35 +198,22 @@ def extract_mentions(text):
 import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument("--auth", type=str, choices=["1", "2"], default="1", help="Auth type: 1=prod, 2=temp")
-parser.add_argument(
-    "--include-secondary",
-    action="store_true",
-    help="Run slow secondary political-tag enrichment from twitter_source.",
-)
-parser.add_argument(
-    "--max-scan-docs",
-    type=int,
-    default=0,
-    help="Limit docs processed in each primary scan (0 = unlimited).",
-)
+parser.add_argument("--topic-label", default=os.getenv("TOPIC_LABEL", DEFAULT_TOPIC_LABEL))
 parser.add_argument(
     "--topic-query",
-    type=str,
-    default="",
-    help="Override topic query for this run (accepted in custom operator format).",
+    default=os.getenv("TOPIC_QUERY", ""),
+    help="OR/comma/pipe/newline separated topic phrases. Defaults to Iran-US war terms.",
 )
+parser.add_argument("--start-date", default=os.getenv("START_DATE", ""))
+parser.add_argument("--end-date", default=os.getenv("END_DATE", ""))
 parser.add_argument(
-    "--start-date",
-    type=str,
-    default="",
-    help="Override start date (YYYY-MM-DD).",
+    "--days",
+    type=int,
+    default=int(os.getenv("LOOKBACK_DAYS", DEFAULT_LOOKBACK_DAYS)),
+    help="Inclusive lookback window when --start-date is omitted (default: 14 days).",
 )
-parser.add_argument(
-    "--end-date",
-    type=str,
-    default="",
-    help="Override end date (YYYY-MM-DD).",
-)
+parser.add_argument("--include-secondary", action="store_true", help="Compatibility flag; secondary metadata is already fetched.")
+parser.add_argument("--max-scan-docs", type=int, default=int(os.getenv("MAX_SCAN_DOCS", "0")))
 args = parser.parse_args()
 auth_type = args.auth
 
@@ -114,57 +257,28 @@ else:
     # print("Invalid selection. Please run the script again and select 1 or 2.")
     sys.exit(1)
 
-# Keyword list (operator semantics: * = OR, + = AND, - = NOT)
-PROTEST_QUERY_RAW = """((('اعتراضات' * 'اعتراضی' * 'تجمعات' * 'تجمعها' * 'تجمعهای' * 'تجمع_ها' * 'تحصن' * 'تحصنات' * 'تظاهرات' * 'تجمع‌های' * 'معترضان' * 'معترضین' * 'اعتراضهای' * 'اعتراضها' * 'اعتراض‌های' * 'اعتراض‌ها' * 'اعتراض_های' * 'اعتراض_ها' * 'تجمع_های' * 'خیزش' * 'تجمع‌ها' * 'اعتصاب' * 'اعتصابات' * 'اعتصاب‌های' * 'اعتصاب_های' * 'اعتصابهای' * 'اعتصاب‌ها' * 'اعتصاب_ها' * 'اعتصابها' * 'اعتراض_سراسری' * 'اعتصابات_سراسری' * 'اعتراضات_سراسری' * 'تظاهرات_سراسری' * 'خیزش_سراسری') + ('کارگر' * 'کارگران' * 'کارگری' * 'بازار' * 'بازاری' * 'بازاریان' * 'معلم' * 'معلمان' * 'معلمی' * 'فرهنگیان' * 'بازنشسته' * 'بازنشستگان' * 'بازنشستگی' * 'دانشگاهیان' * 'دانشجویان' * 'دانشجو' * 'دانشگاه' * 'دانشجویی' * 'مالباخته' * 'مالباختگان' * 'پزشکان' * 'پرستاران' * 'آزمون' * 'خریداران' * 'کشته شدگان' * 'کشته_شدگان' * 'کشته‌شدگان' * 'معلمی' * 'حقوق' * 'مرغداران' * 'دامداران' * 'کشاورزان' * 'کشاورزی' * 'دامداری' * 'مرغداری' * 'مرغدار' * 'دامدار' * 'رانندگان' * 'راننده‌گان' * 'کامیوندارا' * 'کامیونداران' * 'کامیون‌دارا' * 'کامیون‌دارن' * 'کامیون_داران' * 'کامیون_دارا' * 'تبریز' * 'ارومیه' * 'اردبیل' * 'اصفهان' * 'جاوید_نام' * 'جاوید‌نام' * 'جاوید نام' * 'جاویدنام' * 'کرج' * 'ایلام' * 'بوشهر' * 'تهران' * 'شهرکرد' * 'بیرجند' * 'مشهد' * 'بجنورد' * 'اهواز' * 'زنجان' * 'سمنان' * 'زاهدان' * 'شیراز' * 'قزوین' * 'قم' * 'سنندج' * 'کرمان' * 'کرمانشاه' * 'یاسوج' * 'گرگان' * 'رشت' * 'خرم‌آباد' * 'ساری' * 'اراک' * 'بندرعباس' * 'همدان' * 'یزد' * 'ایران' * 'ایرانی' * 'مردم' * 'مردمی'))) - (('دهه_فجر' * 'دهه‌فجر' * 'فجر' * 'دهه فجر' * '22بهمن' * '22 بهمن' * '22_بهمن' * 'ترکیه' * 'سوریه' * 'عراق' * 'لبنان' * 'اسلواکی' * 'جمهوری چک' * 'پاکستان' * 'هند' * 'افغانستان' * 'طالبان' * 'تمرین' * 'تمرینات' * 'ورزش' * 'سلامتی' * 'چربی' * 'تحریر الشام' * 'تحریرالشام' * 'تحریر شام' * 'تحریرشام' * 'جولانی' * 'احمد شرع' * 'احمد_الشرع' * 'احمدالشرع' * 'احمد الشرع' * 'HTS' * 'علوی' * 'علویان' * 'سوری' * 'قسد' * 'اتریش' * 'اسراییل' * 'اوکراین' * 'ایتالیا' * 'آرژانتین' * 'آلمان' * 'آلودگی_هوا' * 'الودگی_هوا' * 'آلودگی' * 'آب و هوا' * 'تایوان' * 'چین' * 'روسیه' * 'عراق' * 'عربستان' * 'کره جنوبی' * 'کره شمالی' * 'هلند' * 'نمره' * 'امتحان' * 'صهیونیست' * 'صهیونیستی' * 'یمن' * 'یمنی' * 'اسراییلی' * 'اسرائیل' * 'اسرائیلی' * 'ایالت' * 'ایالات' * 'بحرین' * 'قطر' * 'دیپلماسی' * 'سفیر' * 'سفارت' * 'ورزشگاه' * 'فوتبال' * 'بازی' * 'پرسپولیس' * 'اخراج_گاریدو' * 'گاریدو' * 'استقلال' * 'مدیرعامل' * 'عربستان' * 'آمریکا' * 'هند' * 'ژاپن' * 'برزیل' * 'آلمان' * 'فرانسه' * 'بریتانیا' * 'ایتالیا' * 'کانادا' * 'استرالیا' * 'مکزیک' * 'ترکیه' * 'کره جنوبی' * 'کره_جنوبی' * 'کره‌جنوبی' * 'اسپانیا' * 'آفریقای جنوبی' * 'آرژانتین' * 'اندونزی' * 'آلمان' * 'آمریکا' * 'آنتیگوآ و باربودا' * 'آروژانتین' * 'استرالیا' * 'اتریش' * 'اتیوپی' * 'اردن' * 'اروگوئه' * 'اسپانیا' * 'اسواتینی' * 'اسلوانی' * 'اسلوواکی' * 'ایالات متحده آمریکا' * 'ایتالیا' * 'ایران' * 'ایسلند' * 'ایرلند' * 'برزیل' * 'بلاروس' * 'بلژیک' * 'بلیز' * 'بنگلادش' * 'بولیوی' * 'بوسنی' * 'بوتسوانا' * 'پاراگوئه' * 'پرو' * 'پرتغال' * 'پاکستان' * 'پاپوآ گینه نو' * 'تایلند' * 'تایوان' * 'ترکیه' * 'تونس' * 'تووالو' * 'سلیمان' * 'مارشال' * 'بریتانیا' * 'چاد' * 'چک' * 'دانمارک' * 'دومنیکا' * 'رومانی' * 'زامبیا' * 'زیمبابوه' * 'سرلانکا' * 'سربستان' * 'سیرالئون' * 'سیشل' * 'سنگاپور' * 'سوئد' * 'سوئیس' * 'سورینام' * 'سوریه' * 'سومالی' * 'سودان' * 'سنگال' * 'صربستان' * 'فرانسه' * 'فنلاند' * 'فلسطین' * 'فلیپین' * 'قبرس' * 'قرقیزستان' * 'قطر' * 'کامبوج' * 'کامرون' * 'کانادا' * 'قزاقستان' * 'کرواسی' * 'کوبا' * 'کویت' * 'کولومبیا' * 'کنیا' * 'کره جنوبی' * 'کره شمالی' * 'کوزوو' * 'کونگو' * 'کیریباتی' * 'لائوس' * 'لهستان' * 'لیبریا' * 'لیبی' * 'لیتوانی' * 'لیختن اشتاین' * 'لتونی' * 'لبنان' * 'لوکزامبورگ' * 'مالاوی' * 'مالدیو' * 'مالزی' * 'مالی' * 'مالت' * 'مراکش' * 'مکزیک' * 'مولدوا' * 'موناکو' * 'مونته نگرو' * 'موزامبیک' * 'نامیبیا' * 'نروژ' * 'نپال' * 'نیجر' * 'نیوزیلند' * 'نیکاراگوآ' * 'یمن' * 'یونان' * 'یمن' * 'فلسطین' * 'فلسطینی' * 'گردوخاک' * 'غزه' * 'گرد و خاک' * 'هواشناسی' * 'وزش باد' * 'ازمون_استخدامی' * 'ازمون‌استخدامی' * 'ازمون استخدامی' * ('نتایج' + 'امتحانات') * 'آزمون_استخدامی' * 'آزمون‌استخدامی' * 'آزمون استخدامی' * (('نتایج') + ('ازمون' * 'آزمون')) )) * ('اعتراض_سراسری' * 'اعتصابات_سراسری' * 'اعتراضات_سراسری' * 'تظاهرات_سراسری' * 'خیزش_سراسری' * 'iranmassacre' * 'digitalblackoutiran' * 'iranrevolution2026' * 'این_اخرین_نبرده_پهلوی_برمیگرده' * 'اعتراضات_سراسری' * 'r2pforiran' * 'digitalblackoutlran' * 'iranprotests' * 'iranianrevolution2026' * 'freeiran' * 'iranrevoiution2026') * ((اغتشاشات * 'نا_ارامی_ها' * 'نا_ارامی‌ها' * 'نا_ارامی ها' * 'نا_ارامیها' * 'نا‌ارامی_ها' * 'نا‌ارامی‌ها' * 'نا‌ارامی ها' * 'نا‌ارامیها' * 'نا ارامی_ها' * 'نا ارامی‌ها' * 'نا ارامی ها' * 'نا ارامیها' * 'ناارامی_ها' * 'ناارامی‌ها' * 'ناارامی ها' * 'ناارامیها' * 'اغتشاشگر' * 'اغتشاشگران' * اشوب * اشوبگر * 'اشوب_طلب' * 'اشوب‌طلب' * 'اشوب طلب' * 'معترضین ' * جانباختگان * 'جانباخته_های' * 'جانباخته‌های' * 'جانباخته های' * 'جانباختههای' * جانباخته * 'جاوید_نام' * 'جاوید‌نام' * 'جاوید نام' * 'جاویدنام' * 'شهید_راه_وطن' * 'شهید_راه‌وطن' * 'شهید_راه وطن' * 'شهید_راهوطن' * 'شهید‌راه_وطن' * 'شهید‌راه‌وطن' * 'شهید‌راه وطن' * 'شهید‌راهوطن' * 'شهید راه_وطن' * 'شهید راه‌وطن' * 'شهید راه وطن' * 'شهید راهوطن' * 'شهیدراه_وطن' * 'شهیدراه‌وطن' * 'شهیدراه وطن' * 'شهیدراهوطن' * 'شهید_راه_ازادی' * 'شهید_راه‌ازادی' * 'شهید_راه ازادی' * 'شهید_راهازادی' * 'شهید‌راه_ازادی' * 'شهید‌راه‌ازادی' * 'شهید‌راه ازادی' * 'شهید‌راهازادی' * 'شهید راه_ازادی' * 'شهید راه‌ازادی' * 'شهید راه ازادی' * 'شهید راهازادی' * 'شهیدراه_ازادی' * 'شهیدراه‌ازادی' * 'شهیدراه ازادی' * 'شهیدراهازادی' * 'شهید_امنیت' * 'شهید‌امنیت' * 'شهید امنیت' * 'شهیدامنیت' * 'مدافعان_امنیت' * 'مدافعان‌امنیت' * 'مدافعان امنیت' * 'معترضان' * 'کشته_شدگان' * 'کشته‌شدگان' * 'کشته شدگان' * 'کشته_شده' * 'کشته‌شده' * 'کشته شده' * 'کشته_شده_ها' * 'کشته_شده‌ها' * 'کشته_شده ها' * 'کشته_شدهها' * 'کشته‌شده_ها' * 'کشته‌شده‌ها' * 'کشته‌شده ها' * 'کشته‌شدهها' * 'کشته شده_ها' * 'کشته شده‌ها' * 'کشته شده ها' * 'کشته شدهها') + ('دی_ماه' * 'دی‌ماه' * 'دی ماه' * 'دیماه'))"""
-PROTEST_QUERY_RAW = """((('اعتراضات' * 'اعتراضی' * 'تجمعات' * 'تجمعها' * 'تجمعهای' * 'تجمع_ها' * 'تحصن' * 'تحصنات' * 'تظاهرات' * 'تجمع‌های' * 'معترضان' * 'معترضین' * 'اعتراضهای' * 'اعتراضها' * 'اعتراض‌های' * 'اعتراض‌ها' * 'اعتراض_های' * 'اعتراض_ها' * 'تجمع_های' * 'خیزش' * 'تجمع‌ها' * 'اعتصاب' * 'اعتصابات' * 'اعتصاب‌های' * 'اعتصاب_های' * 'اعتصابهای' * 'اعتصاب‌ها' * 'اعتصاب_ها' * 'اعتصابها' * 'اعتراض_سراسری' * 'اعتصابات_سراسری' * 'اعتراضات_سراسری' * 'تظاهرات_سراسری' * '')))"""
-
-if args.topic_query:
-    PROTEST_QUERY_RAW = args.topic_query
-
-def _to_query_string(raw: str) -> str:
-    """Convert custom operators to Elasticsearch simple_query_string syntax."""
-    # Use double quotes for phrases; Lucene expects "
-    q = raw.replace("'", '"')
-    # Convert custom operators with flexible spacing
-    q = re.sub(r"\s*\*\s*", " OR ", q)      # OR
-    q = re.sub(r"\s*\+\s*", " AND ", q)     # AND
-    q = re.sub(r"\s*-\s*", " AND NOT ", q)  # NOT
-    # Normalize spacing
-    q = re.sub(r"\s+", " ", q).strip()
-    return q
-
-
-PROTEST_QUERY = _to_query_string(PROTEST_QUERY_RAW)
-
-today = datetime.utcnow().date()
-start_date = (today - timedelta(days=60)).strftime("%Y-%m-%d")
-end_date = today.strftime("%Y-%m-%d")
-if args.start_date:
-    start_date = args.start_date
-if args.end_date:
-    end_date = args.end_date
+lookback_days = max(1, args.days)
+start_date, end_date = resolve_date_range(
+    args.start_date,
+    args.end_date,
+    lookback_days=lookback_days,
+)
+range_days = (end_date - start_date).days + 1
+topic_terms = parse_topic_terms(args.topic_query) or DEFAULT_WAR_TOPIC_TERMS
 
 query_body = {
     "track_total_hits": True,
     "query": {
         "bool": {
             "must": [
-                {
-                    "simple_query_string": {
-                        "query": PROTEST_QUERY,
-                        "fields": ["normalized_text", "text"],
-                        "default_operator": "OR",
-                        "flags": "OR|AND|NOT|PHRASE|PRECEDENCE",
-                        "lenient": True
-                    }
-                }
+                build_topic_clause(topic_terms)
             ],
             "filter": [
                 {
                     "range": {
                         "date": {
-                            "gte": start_date,
-                            "lte": end_date,
+                            "gte": start_date.isoformat(),
+                            "lte": end_date.isoformat(),
                             "format": "yyyy-MM-dd"
                         }
                     }
@@ -175,6 +289,7 @@ query_body = {
     "_source": [
         "user_name",
         "normalized_text",
+        "text",
         "content",
         "text",
         "comment",
@@ -196,11 +311,40 @@ query_body = {
         "retweeted_status",
         "quoted_status",
         "entity.mention",
-        "entity.mention.user_name",
+        "entity.hashtag",
+        "reply",
+        "reply_to",
+        "reply_to_user",
+        "in_reply_to_user",
+        "in_reply_to_screen_name",
+        "quote",
+        "quoted_status",
+        "repost",
+        "retweet",
+        "retweeted_status",
         "category.label",
         "emotion.label",
     ]
 }
+
+pipeline_config = {
+    "topic_label": args.topic_label,
+    "topic_terms": topic_terms,
+    "start_date": start_date.isoformat(),
+    "end_date": end_date.isoformat(),
+    "lookback_days": range_days,
+    "slot_modes": select_slot_modes(start_date, end_date),
+    "generated_at": datetime.now().isoformat(timespec="seconds"),
+}
+with open(PIPELINE_CONFIG_PATH, "w", encoding="utf-8") as f:
+    json.dump(pipeline_config, f, ensure_ascii=False, indent=2)
+log.info(
+    "Pipeline config: topic=%s range=%s..%s terms=%s",
+    args.topic_label,
+    start_date.isoformat(),
+    end_date.isoformat(),
+    len(topic_terms),
+)
 
 type_counter = Counter()
 
@@ -311,38 +455,26 @@ primary_scan = scan(
     scroll="10m"
 )
 
-# Extract all distinct usernames and displaynames
+# Extract all distinct author usernames.
 usernames = set()
-displaynames = set()
 COUNT = 0
-try:
-    with open("res.json", "w", encoding="utf-8") as f:
-        for doc in primary_scan:
-            if args.max_scan_docs and COUNT >= args.max_scan_docs:
-                log.warning(f"[limit] Reached max-scan-docs={args.max_scan_docs} in primary scan.")
-                break
-            source = doc["_source"]
-            raw_type = source.get("type")
-            tweet_type = "quote" if raw_type in {"quote", "qoute"} else (raw_type or "").lower()
-            if tweet_type in {"retweet", "re-tweet", "rt"}:
-                tweet_type = "repost"
-            if tweet_type not in {"post", "reply", "quote", "repost"}:
-                log.warning(f"❓ Unrecognized tweet_type: {tweet_type} (raw={raw_type})")
-            type_counter[tweet_type] += 1
-            json.dump(source, f, ensure_ascii=False)
-            f.write("\n")
-            COUNT += 1
-            uname = source.get("user_name")
-            dname = source.get("user_title")
-            if uname:
-                usernames.add(uname)
-            if dname:
-                displaynames.add(dname)
-finally:
-    try:
-        primary_scan.close()
-    except Exception:
-        pass
+with open("res.json", "w", encoding="utf-8") as f:
+    for doc in result:
+        source = doc["_source"]
+        raw_type = source.get("type")
+        tweet_type = normalize_tweet_type(raw_type)
+        if tweet_type not in {"post", "reply", "quote", "repost"}:
+            log.warning(f"❓ Unrecognized tweet_type: {tweet_type} (raw={raw_type})")
+        type_counter[tweet_type] += 1
+        json.dump(source, f, ensure_ascii=False)
+        f.write("\n")
+        COUNT += 1
+        uname = normalize_user_handle(source.get("user_name"))
+        if uname:
+            usernames.add(uname)
+        if args.max_scan_docs and COUNT >= args.max_scan_docs:
+            log.info(f"Reached --max-scan-docs={args.max_scan_docs} in initial scan.")
+            break
 log.info(f"Total hits: {COUNT}")
 log.info(f"TWEET TYPE COUNTS IN SCAN 1: {dict(type_counter)}")
 
@@ -355,99 +487,114 @@ interaction_scan = scan(
     preserve_order=True
 )
 
-written = 0
-processed_docs = 0
-EXAMPLE_LIMIT = 10
-EXAMPLE_PRINTED = 0
-try:
-    with open("interactions.json", "w", encoding="utf-8") as f_interactions:
-        for doc in interaction_scan:
-            if args.max_scan_docs and processed_docs >= args.max_scan_docs:
-                log.warning(f"[limit] Reached max-scan-docs={args.max_scan_docs} in interaction scan.")
-                break
-            processed_docs += 1
-            source = doc["_source"]
-            raw_type = source.get("type")
-            tweet_type = "quote" if raw_type in {"quote", "qoute"} else (raw_type or "").lower()
-            # Only warn for truly unrecognized tweet types
-            if tweet_type not in {"post", "reply", "quote", "repost"}:
-                log.warning(f"❓ Unrecognized tweet_type: {tweet_type} (raw={raw_type})")
-            # Remove repetitive example doc logging
-            # Remove repetitive info log for every doc
-            # Remove debug log for every tweet type
-            sender = source.get("user_name")
-            date_val = source.get("date") or source.get("timestamp") or source.get("crawl_date")
-            date_str = str(date_val)[:10] if date_val else ""
+interaction_usernames = set(usernames)
+with open("interactions.json", "w", encoding="utf-8") as f_interactions:
+    written = 0
+    scanned_docs = 0
+    EXAMPLE_LIMIT = 10
+    EXAMPLE_PRINTED = 0
+    for doc in result:
+        scanned_docs += 1
+        if args.max_scan_docs and scanned_docs > args.max_scan_docs:
+            log.info(f"Reached --max-scan-docs={args.max_scan_docs} in interaction scan.")
+            break
+        source = doc["_source"]
+        raw_type = source.get("type")
+        tweet_type = normalize_tweet_type(raw_type)
+        # Only warn for truly unrecognized tweet types
+        if tweet_type not in {"post", "reply", "quote", "repost"}:
+            log.warning(f"❓ Unrecognized tweet_type: {tweet_type} (raw={raw_type})")
+        # Remove repetitive example doc logging
+        # Remove repetitive info log for every doc
+        # Remove debug log for every tweet type
+        sender = normalize_user_handle(source.get("user_name"))
+        date_str = source.get("date", "")
 
-            if not sender or not tweet_type or not date_str:
+        if not sender or not tweet_type or not date_str:
+            continue
+
+        # Handle structured interaction types
+        if tweet_type == "reply":
+            target = get_reply_target(source)
+            if not target:
+                # Only warn once for missing target user
+                # log.warning("⛔ Skipped reply: No target user.")
                 continue
+            elif same_user(target, sender):
+                # log.warning("⛔ Skipped reply: Target same as sender.")
+                continue
+            else:
+                interaction = {
+                    "sender": sender,
+                    "target": target,
+                    "type": "reply",
+                    "date": date_str
+                }
+                log.info(f"Writing interaction: {interaction}")
+                json.dump(interaction, f_interactions, ensure_ascii=False)
+                f_interactions.write("\n")
+                interaction_usernames.add(target)
+                written += 1
+        elif tweet_type == "quote":
+            quoted_user = get_quote_target(source)
+            if not quoted_user:
+                # log.warning("⛔ Skipped quote: No quoted user.")
+                continue
+            elif same_user(quoted_user, sender):
+                # log.warning("⛔ Skipped quote: Self-quote.")
+                continue
+            else:
+                interaction = {
+                    "sender": sender,
+                    "target": quoted_user,
+                    "type": "quote",
+                    "date": date_str
+                }
+                log.info(f"Writing interaction: {interaction}")
+                json.dump(interaction, f_interactions, ensure_ascii=False)
+                f_interactions.write("\n")
+                interaction_usernames.add(quoted_user)
+                written += 1
 
-            # Handle structured interaction types
-            if tweet_type == "reply":
-                target = (
-                    source.get("reply_to_user")
-                    or source.get("reply_to")
-                    or source.get("in_reply_to_user")
-                    or source.get("in_reply_to_screen_name")
-                    or _extract_user(source.get("reply"))
+        elif tweet_type == "repost":
+            retweeted_user = get_repost_target(source)
+            if not retweeted_user:
+                # log.warning("⛔ Skipped repost: No retweeted user.")
+                continue
+            elif same_user(retweeted_user, sender):
+                # log.warning("⛔ Skipped repost: Self-repost.")
+                continue
+            else:
+                interaction = {
+                    "sender": sender,
+                    "target": retweeted_user,
+                    "type": "repost",
+                    "date": date_str
+                }
+                log.info(f"Writing interaction: {interaction}")
+                json.dump(interaction, f_interactions, ensure_ascii=False)
+                f_interactions.write("\n")
+                interaction_usernames.add(retweeted_user)
+                written += 1
+
+        elif tweet_type == "post":
+            # log.warning("🟡 Processing a POST tweet...")
+            entity = source.get("entity")
+            mentions = entity.get("mention", []) if isinstance(entity, dict) else []
+            if not mentions:
+                text = (
+                    source.get("normalized_text")
+                    or source.get("text")
+                    or source.get("content")
+                    or ""
                 )
-                if not target:
-                    # Only warn once for missing target user
-                    # log.warning("⛔ Skipped reply: No target user.")
-                    continue
-                elif target == sender:
-                    # log.warning("⛔ Skipped reply: Target same as sender.")
-                    continue
-                else:
-                    interaction = {
-                        "sender": sender,
-                        "target": target,
-                        "type": "reply",
-                        "date": date_str
-                    }
-                    log.info(f"Writing interaction: {interaction}")
-                    json.dump(interaction, f_interactions, ensure_ascii=False)
-                    f_interactions.write("\n")
-                    written += 1
-            elif tweet_type == "quote":
-                quote = source.get("quote") or source.get("quoted_status") or {}
-                if not isinstance(quote, dict):
-                    # log.warning("⛔ Skipped quote: Not a dict.")
-                    continue
-                else:
-                    quoted_user = _extract_user(quote)
-                    if not quoted_user:
-                        # log.warning("⛔ Skipped quote: No quoted user.")
-                        continue
-                    elif quoted_user == sender:
-                        # log.warning("⛔ Skipped quote: Self-quote.")
-                        continue
-                    else:
-                        interaction = {
-                            "sender": sender,
-                            "target": quoted_user,
-                            "type": "quote",
-                            "date": date_str
-                        }
-                        log.info(f"Writing interaction: {interaction}")
-                        json.dump(interaction, f_interactions, ensure_ascii=False)
-                        f_interactions.write("\n")
-                        written += 1
-
-            elif tweet_type == "repost":
-                repost = source.get("repost") or source.get("retweeted_status") or source.get("retweet") or {}
-                if not isinstance(repost, dict):
-                    # log.warning("⛔ Skipped repost: Not a dict.")
-                    continue
-                else:
-                    retweeted_user = _extract_user(repost)
-                    if not retweeted_user:
-                        # log.warning("⛔ Skipped repost: No retweeted user.")
-                        continue
-                    elif retweeted_user == sender:
-                        # log.warning("⛔ Skipped repost: Self-repost.")
-                        continue
-                    else:
+                mentions = extract_mentions(text)
+                # log.warning(f"🔍 Mentions found after fallback: {mentions}")
+            
+            if mentions:
+                for mention in mentions:
+                    target = normalize_user_handle(mention)
+                    if target and not same_user(target, sender):
                         interaction = {
                             "sender": sender,
                             "target": retweeted_user,
@@ -457,6 +604,7 @@ try:
                         log.info(f"Writing interaction: {interaction}")
                         json.dump(interaction, f_interactions, ensure_ascii=False)
                         f_interactions.write("\n")
+                        interaction_usernames.add(target)
                         written += 1
 
             elif tweet_type == "post":
@@ -512,158 +660,110 @@ log.info("Extracted interactions written to interactions.json")
 log.info("Finished writing interactions.json.")
 log.info("Finished processing all interaction types.")
 
-if args.include_secondary:
-    log.info("Querying twitter_source for political tags...")
+# Query twitter_source for political tags
+log.info("Querying twitter_source for political tags...")
 
-    def chunked(iterable, size):
-        iterable = list(iterable)
-        return [iterable[i:i + size] for i in range(0, len(iterable), size)]
+def chunked(iterable, size):
+    iterable = list(iterable)
+    return [iterable[i:i+size] for i in range(0, len(iterable), size)]
 
-    log.info("Chunking user_name and user_title lists for political tagging...")
-    username_chunks = chunked(usernames, 100)
-    displayname_chunks = chunked(displaynames, 100)
 
-    total_batches = len(username_chunks) + len(displayname_chunks)
-    batch_index = 1
-    secondary_count = 0
+def search_secondary_metadata(query, batch_label):
+    try:
+        return list(scan(
+            es,
+            index="twitter_source",
+            query=query,
+            size=1000,
+            scroll="5m",
+            request_timeout=60,
+        ))
+    except Exception as exc:
+        log.warning(f"Skipping secondary metadata batch {batch_label}: {exc}")
+        return []
 
-    with open("res.json", "w", encoding="utf-8") as f:
-        for chunk in username_chunks:
-            log.info(f"Querying batch {batch_index}/{total_batches} [usernames]")
-            query = {
-                "query": {
-                    "bool": {
-                        "should": [{"match": {"user_name": uname}} for uname in chunk],
-                        "minimum_should_match": 1
-                    }
-                },
-                "_source": [
-                    "user_name",
-                    "normalized_text",
-                    "content",
-                    "user_title",
-                    "political_category.label",
-                    "type",
-                    "entity.mention",
-                    "category.label",
-                    "emotion.label",
-                    "entity.hashtag",
-                    "language.label",
-                    "ner.event",
-                    "ner.location",
-                    "ner.nationality",
-                    "ner.organ",
-                    "ner.person",
-                    "ner.politic_group",
-                    "offensive.label",
-                    "sentiment.label"
-                ]
-            }
-            results = es.search(index="twitter_source", body=query, size=1000)["hits"]["hits"]
-            for doc in results:
-                source = doc["_source"]
-                uname = source.get("user_name")
-                dname = source.get("user_title")
-                political = source.get("political_category", {})
-                label = political.get("label") if isinstance(political, dict) else None
-                if uname and dname and label:
-                    output_doc = {
-                        "user_name": uname,
-                        "user_title": dname,
-                        "political_label": label,
-                        "normalized_text": source.get("normalized_text"),
-                        "content": source.get("content"),
-                        "category": source.get("category", {}).get("label"),
-                        "emotion": source.get("emotion", {}).get("label"),
-                        "hashtag": source.get("entity", {}).get("hashtag"),
-                        "language": source.get("language", {}).get("label"),
-                        "event": source.get("ner", {}).get("event"),
-                        "location": source.get("ner", {}).get("location"),
-                        "nationality": source.get("ner", {}).get("nationality"),
-                        "organization": source.get("ner", {}).get("organ"),
-                        "person": source.get("ner", {}).get("person"),
-                        "politic_group": source.get("ner", {}).get("politic_group"),
-                        "offensive": source.get("offensive", {}).get("label"),
-                        "sentiment": source.get("sentiment", {}).get("label")
-                    }
-                    json.dump(output_doc, f, ensure_ascii=False)
-                    f.write("\n")
-                    secondary_count += 1
-            batch_index += 1
+log.info("Chunking sender and target usernames for exact political tagging...")
+metadata_usernames = sorted(interaction_usernames, key=str.casefold)
+username_chunks = chunked(metadata_usernames, 500)
 
-        for chunk in displayname_chunks:
-            log.info(f"Querying batch {batch_index}/{total_batches} [displaynames]")
-            query = {
-                "query": {
-                    "bool": {
-                        "should": [{"match": {"user_title": dname}} for dname in chunk],
-                        "minimum_should_match": 1
-                    }
-                },
-                "_source": [
-                    "user_name",
-                    "normalized_text",
-                    "content",
-                    "user_title",
-                    "political_category.label",
-                    "type",
-                    "entity.mention",
-                    "category.label",
-                    "emotion.label",
-                    "entity.hashtag",
-                    "language.label",
-                    "ner.event",
-                    "ner.location",
-                    "ner.nationality",
-                    "ner.organ",
-                    "ner.person",
-                    "ner.politic_group",
-                    "offensive.label",
-                    "sentiment.label"
-                ]
-            }
-            results = es.search(index="twitter_source", body=query, size=1000)["hits"]["hits"]
-            for doc in results:
-                source = doc["_source"]
-                uname = source.get("user_name")
-                dname = source.get("user_title")
-                political = source.get("political_category", {})
-                label = political.get("label") if isinstance(political, dict) else None
-                if uname and dname and label:
-                    output_doc = {
-                        "user_name": uname,
-                        "user_title": dname,
-                        "political_label": label,
-                        "normalized_text": source.get("normalized_text"),
-                        "content": source.get("content"),
-                        "category": source.get("category", {}).get("label"),
-                        "emotion": source.get("emotion", {}).get("label"),
-                        "hashtag": source.get("entity", {}).get("hashtag"),
-                        "language": source.get("language", {}).get("label"),
-                        "event": source.get("ner", {}).get("event"),
-                        "location": source.get("ner", {}).get("location"),
-                        "nationality": source.get("ner", {}).get("nationality"),
-                        "organization": source.get("ner", {}).get("organ"),
-                        "person": source.get("ner", {}).get("person"),
-                        "politic_group": source.get("ner", {}).get("politic_group"),
-                        "offensive": source.get("offensive", {}).get("label"),
-                        "sentiment": source.get("sentiment", {}).get("label")
-                    }
-                    json.dump(output_doc, f, ensure_ascii=False)
-                    f.write("\n")
-                    secondary_count += 1
-            batch_index += 1
+total_batches = len(username_chunks)
+BATCH_INDEX = 1
+SECONDARY_COUNT = 0
+WRITTEN_METADATA_USERS = set()
 
-    log.info(f"Political tag hits: {secondary_count}")
-    log.info("Finished writing political tags to res.json.")
+with open("res.json", "w", encoding="utf-8") as f:
+    for chunk in username_chunks:
+        log.info(f"Querying batch {BATCH_INDEX}/{total_batches} [usernames]")
+        query = {
+            "query": {
+                # `user_name` is the verified exact field in twitter_source.
+                "terms": {"user_name": chunk}
+            },
+            "_source": [
+                "user_name",
+                "normalized_text",
+                "text",
+                "content",
+                "user_title",
+                "political_category.label",
+                "type",
+                "entity.mention",
+                "category.label",
+                "emotion.label",
+                "entity.hashtag",
+                "language.label",
+                "ner.event",
+                "ner.location",
+                "ner.nationality",
+                "ner.organ",
+                "ner.person",
+                "ner.politic_group",
+                "offensive.label",
+                "sentiment.label"
+            ]
+        }
+        results = search_secondary_metadata(query, f"{BATCH_INDEX}/{total_batches} usernames")
+        for doc in results:
+            source = doc["_source"]
+            uname = source.get("user_name")
+            dname = source.get("user_title")
+            political = source.get("political_category", {})
+            label = political.get("label") if isinstance(political, dict) else None
+            normalized_uname = normalize_user_handle(uname)
+            metadata_key = normalized_uname.casefold() if normalized_uname else None
+            if normalized_uname and label and metadata_key not in WRITTEN_METADATA_USERS:
+                output_doc = {
+                    "user_name": normalized_uname,
+                    "user_title": dname,
+                    "political_label": label,
+                    "normalized_text": source.get("normalized_text"),
+                    "content": source.get("text") or source.get("content"),
+                    "category": get_nested_value(source, "category", "label"),
+                    "emotion": get_nested_value(source, "emotion", "label"),
+                    "hashtag": get_nested_value(source, "entity", "hashtag"),
+                    "language": get_nested_value(source, "language", "label"),
+                    "event": get_nested_value(source, "ner", "event"),
+                    "location": get_nested_value(source, "ner", "location"),
+                    "nationality": get_nested_value(source, "ner", "nationality"),
+                    "organization": get_nested_value(source, "ner", "organ"),
+                    "person": get_nested_value(source, "ner", "person"),
+                    "politic_group": get_nested_value(source, "ner", "politic_group"),
+                    "offensive": get_nested_value(source, "offensive", "label"),
+                    "sentiment": get_nested_value(source, "sentiment", "label")
+                }
+                json.dump(output_doc, f, ensure_ascii=False)
+                f.write("\n")
+                WRITTEN_METADATA_USERS.add(metadata_key)
+                SECONDARY_COUNT += 1
+        BATCH_INDEX += 1
 
-    # Automatically call normalize_json.py only when secondary enrichment is enabled.
-    cur_path = os.path.dirname(__file__)
-    normalize_script = os.path.join(cur_path, "normalize_json.py")
-    subprocess.run(["python3", normalize_script], check=True)
-    log.info("Normalization complete.")
-else:
-    log.warning("[fast] Skipping secondary enrichment. Use --include-secondary for full tagging.")
+log.info(f"Political tag hits: {SECONDARY_COUNT}")
+log.info(
+    "Political metadata coverage: %s/%s interaction accounts",
+    SECONDARY_COUNT,
+    len(metadata_usernames),
+)
+log.info("Finished writing political tags to res.json.")
 
 # Show preview of res.json (last 3 lines)
 with open("res.json", "r", encoding="utf-8") as f:

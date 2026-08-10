@@ -25,7 +25,6 @@ def force_regenerate_last_dashboard():
     related_files = [
         last_dashboard,
         f"{base_name}_legend.json",
-        last_dashboard.replace("dashboard_", "louvain_graph_"),
         last_dashboard.replace("dashboard_", "hybrid_graph_")
     ]
     
