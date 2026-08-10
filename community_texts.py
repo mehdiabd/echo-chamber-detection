@@ -3,7 +3,7 @@ Fetch top or recent tweets for a community's nodes from Elasticsearch.
 """
 
 import json
-from elastic import es
+from elastic_client import es
 
 
 def fetch_recent_tweets(username, index="twitter_temp_data", size=5):

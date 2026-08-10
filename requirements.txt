@@ -13,3 +13,6 @@ pyvis==0.3.2
 # Search & retrieval
 elasticsearch
 ollama
+
+# Environment management
+python-dotenv==1.0.0
