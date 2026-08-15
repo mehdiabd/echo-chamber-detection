@@ -19,7 +19,7 @@ Requires Docker Desktop / Docker Engine with Compose v2.
 
 ```bash
 cp .env.example .env   # optional; add SYNAPPSE_API_KEY if you use LLM naming
-make docker-up         # party-change API on http://localhost:8765
+make docker-up         # Echo Chamber API on http://localhost:8765
 make docker-elastic    # fetch Elasticsearch data into the project root
 make docker-pipeline   # run community detection (writes dashboards into ./)
 make docker-down
@@ -82,36 +82,100 @@ The community detection pipeline also rotates generated root artifacts before
 and after a run. Use `--no-config-protect` only when you intentionally want old
 artifacts from the configured date range removed too.
 
-## Party-change API
+## HTTP API
 
-Start the local backend:
+The unified service in `echo_chamber_api.py` covers party-change events,
+pipeline runs, echo-chamber reports, dashboard/timeline metadata, and human
+review. Party-change ingestion from `community_detection.py` is unchanged.
+
+Start it locally:
 
 ```bash
-make party-change-api
+make api
 ```
 
-Point the detection pipeline at it:
+`make docker-up` starts the same service on http://localhost:8765. Set
+`PARTY_CHANGE_API_TOKEN` or `ECHO_API_TOKEN` to require bearer-token
+authentication. The health endpoint is `GET /health`. Swagger UI is
+`http://localhost:8765/docs`; the OpenAPI document is
+`http://localhost:8765/openapi.json` and can be imported into Postman
+(Import → Link). Use the Authorize button in `/docs` when a bearer token
+is set. `/health`, `/docs`, `/redoc`, and `/openapi.json` stay public.
+
+A frontend can rebuild the timeline from `GET /api/v1/dashboards`,
+`GET /api/v1/topics`, and `GET /api/v1/files/{filename}` instead of
+scraping `timeline_dashboard.html`. Screen-by-screen map:
+[FRONTEND.md](FRONTEND.md).
+
+Run the portable test suite locally with `make test`, or inside the API
+image (the same command a Kubernetes Job can copy) with `make docker-test`.
+
+Point the detection pipeline at party-change storage:
 
 ```bash
 export PARTY_CHANGE_API_URL=http://127.0.0.1:8765/api/v1/party-changes
 python3 community_detection.py
 ```
 
-Query detected transitions:
+### Pipeline Run + Report
+
+```bash
+curl -X POST http://127.0.0.1:8765/api/v1/pipeline/runs \
+  -H 'Content-Type: application/json' \
+  -d '{"topic_label":"جنگ","start_date":"2026-01-01","end_date":"2026-01-14","fetch":true,"detect":true}'
+curl 'http://127.0.0.1:8765/api/v1/pipeline/runs'
+curl 'http://127.0.0.1:8765/api/v1/pipeline/config'
+curl 'http://127.0.0.1:8765/api/v1/reports'
+curl 'http://127.0.0.1:8765/api/v1/reports/<report_id>'
+curl 'http://127.0.0.1:8765/api/v1/communities/<report_id>/<community_id>'
+```
+
+`POST /api/v1/pipeline/runs` starts Elasticsearch fetch (`elastic.py`) and
+community detection (`community_detection.py`) in the background. Only one run
+is active at a time; a second start returns `409`. Use `"fetch": false` to
+reuse `interactions.json`, or `"detect": false` to fetch data only.
+
+### Dashboard / Timeline
+
+```bash
+curl 'http://127.0.0.1:8765/api/v1/dashboards'
+curl 'http://127.0.0.1:8765/api/v1/dashboards/daily_260101_to_260102'
+curl 'http://127.0.0.1:8765/api/v1/topics'
+curl 'http://127.0.0.1:8765/api/v1/files/dashboard_daily_260101_to_260102.html'
+```
+
+Dashboard slots return legend JSON, graph links, and date metadata so a client
+can render the timeline without scraping static HTML.
+
+### Human Review
+
+```bash
+curl -X POST http://127.0.0.1:8765/api/v1/review/samples \
+  -H 'Content-Type: application/json' \
+  -d '{"method":"both","sample_size":20,"min_size":1,"seed":42}'
+curl -X POST http://127.0.0.1:8765/api/v1/review/labels \
+  -H 'Content-Type: application/json' \
+  -d '{"labels":[{"sample_id":"...","human_label":1,"notes":""}]}'
+curl 'http://127.0.0.1:8765/api/v1/review/metrics'
+```
+
+Sampling reuses the balanced picker from `sample_echo_review.py`. Metrics are
+precision, recall, F1, and accuracy against `human_label`.
+
+### Party Change
 
 ```bash
 curl 'http://127.0.0.1:8765/api/v1/party-changes?limit=100'
 curl 'http://127.0.0.1:8765/api/v1/party-changes?node_id=some_username'
 ```
 
-The service stores data in `runtime_data/party_changes.sqlite3`, outside the
-generated-output paths and ignored by Git. It rotates records during ingestion;
-the defaults retain 365 days and at most 100,000 events. Configure these with
-`PARTY_CHANGE_RETENTION_DAYS`, `PARTY_CHANGE_MAX_EVENTS`, and
-`PARTY_CHANGE_DB_PATH`.
+Party-change events stay in `runtime_data/party_changes.sqlite3`. Pipeline runs
+and review labels use `runtime_data/echo_chamber.sqlite3`. Both are outside
+generated-output paths and ignored by Git. Party-change rotation defaults to
+365 days and at most 100,000 events (`PARTY_CHANGE_RETENTION_DAYS`,
+`PARTY_CHANGE_MAX_EVENTS`, `PARTY_CHANGE_DB_PATH`).
 
-Set `PARTY_CHANGE_API_TOKEN` in both processes to require bearer-token
-authentication. The health endpoint is `GET /health`.
+`make party-change-api` still starts the narrower party-change-only server.
 
 ## License
 

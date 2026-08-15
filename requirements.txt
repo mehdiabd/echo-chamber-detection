@@ -19,3 +19,7 @@ python-dateutil
 
 # Environment management
 python-dotenv==1.0.0
+
+# HTTP API
+fastapi==0.115.6
+uvicorn==0.32.1

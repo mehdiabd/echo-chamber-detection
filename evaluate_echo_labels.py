@@ -103,6 +103,56 @@ def _metrics_from_confusion(matrix: Dict[str, int]) -> Dict[str, float]:
     }
 
 
+def evaluate_label_rows(
+    rows,
+    pred_col: str = "predicted_is_echo",
+    truth_col: str = "human_label",
+    method_col: str = "method",
+) -> Dict[str, object]:
+    """Compute precision/recall metrics from predicted vs human labels."""
+    total_rows = 0
+    used_rows = 0
+    skipped_unlabeled = 0
+    invalid_truth = 0
+    invalid_pred = 0
+    overall = _empty_confusion()
+    by_method: Dict[str, Dict[str, int]] = {}
+
+    for row in rows:
+        total_rows += 1
+        pred, truth, raw_pred, raw_truth = _parse_row_labels(row, pred_col, truth_col)
+        if truth is None:
+            if not str(raw_truth).strip():
+                skipped_unlabeled += 1
+            else:
+                invalid_truth += 1
+            continue
+        if pred is None:
+            invalid_pred += 1
+            continue
+        used_rows += 1
+        _update_confusion(overall, pred, truth)
+        method = str(row.get(method_col, "") or "unknown").strip() or "unknown"
+        if method not in by_method:
+            by_method[method] = _empty_confusion()
+        _update_confusion(by_method[method], pred, truth)
+
+    return {
+        "rows": {
+            "total": total_rows,
+            "used": used_rows,
+            "unlabeled": skipped_unlabeled,
+            "invalid_truth": invalid_truth,
+            "invalid_pred": invalid_pred,
+        },
+        "overall": _metrics_from_confusion(overall),
+        "by_method": {
+            method: _metrics_from_confusion(confusion)
+            for method, confusion in sorted(by_method.items())
+        },
+    }
+
+
 def _fmt_pct(value: float) -> str:
     return f"{value * 100:.2f}%"
 
@@ -122,8 +172,14 @@ def _print_metrics(label: str, metrics: Dict[str, float]) -> None:
 def _parse_row_labels(
     row: Dict[str, str], pred_col: str, truth_col: str
 ) -> Tuple[Optional[int], Optional[int], str, str]:
-    raw_pred = str(row.get(pred_col, "")).strip()
-    raw_truth = str(row.get(truth_col, "")).strip()
+    raw_pred = row.get(pred_col, "")
+    raw_truth = row.get(truth_col, "")
+    if raw_pred is None:
+        raw_pred = ""
+    if raw_truth is None:
+        raw_truth = ""
+    raw_pred = str(raw_pred).strip()
+    raw_truth = str(raw_truth).strip()
     pred = _parse_binary_label(raw_pred)
     truth = _parse_binary_label(raw_truth)
     return pred, truth, raw_pred, raw_truth
