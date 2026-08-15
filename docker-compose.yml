@@ -1,0 +1,39 @@
+services:
+  api:
+    build: .
+    ports: ["8765:8765"]
+    env_file: [.env]
+    environment:
+      PARTY_CHANGE_API_HOST: "0.0.0.0"
+      PARTY_CHANGE_API_PORT: "8765"
+      PARTY_CHANGE_DB_PATH: /app/runtime_data/party_changes.sqlite3
+    volumes:
+      - .:/app
+      - runtime_data:/app/runtime_data
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    restart: unless-stopped
+
+  pipeline:
+    build: .
+    profiles: [pipeline]
+    env_file: [.env]
+    environment:
+      MPLBACKEND: Agg
+      PARTY_CHANGE_API_URL: http://api:8765/api/v1/party-changes
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
+      ENABLE_LLM_NAMING: ${ENABLE_LLM_NAMING:-true}
+    volumes: [.:/app]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    depends_on: [api]
+    command: ["python", "-B", "community_detection.py"]
+
+  elastic:
+    build: .
+    profiles: [elastic]
+    env_file: [.env]
+    volumes: [.:/app]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    command: ["python", "-B", "elastic.py"]
+
+volumes:
+  runtime_data:

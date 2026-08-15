@@ -13,6 +13,24 @@ pip install -r requirements.txt
 pip install -r dev-requirements.txt
 ```
 
+## Docker (recommended for any local machine)
+
+Requires Docker Desktop / Docker Engine with Compose v2.
+
+```bash
+cp .env.example .env   # optional; add SYNAPPSE_API_KEY if you use LLM naming
+make docker-up         # party-change API on http://localhost:8765
+make docker-elastic    # fetch Elasticsearch data into the project root
+make docker-pipeline   # run community detection (writes dashboards into ./)
+make docker-down
+```
+
+The compose stack bind-mounts the project directory, so `interactions.json`,
+`res.json`, `pipeline_config.json`, `ca.crt`, and generated HTML stay on the
+host. Runtime SQLite lives in the `runtime_data` Docker volume. Local Ollama is
+reached via `host.docker.internal:11434`. Set `ENABLE_LLM_NAMING=false` in
+`.env` to skip LLMs entirely.
+
 ## Usage
 
 - Run notebooks for data collection, graph building, and community detection.
