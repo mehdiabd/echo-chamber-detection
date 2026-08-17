@@ -31,6 +31,55 @@ host. Runtime SQLite lives in the `runtime_data` Docker volume. Local Ollama is
 reached via `host.docker.internal:11434`. Set `ENABLE_LLM_NAMING=false` in
 `.env` to skip LLMs entirely.
 
+`make docker-up` starts **only the HTTP API**. It does not run Elasticsearch
+and it does not generate dashboards. HTML/JSON artifacts are gitignored, so a
+fresh clone has empty `/api/v1/dashboards` until you copy artifacts or fetch
+data (below). `.env` is optional for Compose (`required: false`); `make`
+still copies `.env.example` when the file is missing.
+
+## Elasticsearch data fetch
+
+There is no Elasticsearch container in this repo. `elastic.py` talks to the
+organization cluster on the LAN/VPN:
+
+| `ELASTIC_AUTH` | Host | Cert (gitignored) | Index |
+|---|---|---|---|
+| `1` (default) | `https://192.168.59.79:9200` | `ca.crt` | `twitter_temp_data` |
+| `2` | `https://192.168.59.26:9200` | `http_ca.crt` | `twitter_maroufi` |
+
+Put the cert in the project root, fill `.env`, then:
+
+```bash
+# .env examples:
+# TOPIC_LABEL=جنگ
+# START_DATE=2026-08-01
+# END_DATE=2026-08-14
+# LOOKBACK_DAYS=14          # used when START_DATE is empty
+# TOPIC_QUERY=              # optional; default is the built-in war terms
+# MAX_SCAN_DOCS=0           # 0 = no cap
+# ELASTIC_AUTH=1
+
+make docker-elastic         # writes interactions.json, res.json, pipeline_config.json
+make docker-pipeline        # builds dashboards/reports from those files
+```
+
+Equivalent without Make, after `cp .env.example .env`:
+
+```bash
+docker compose --profile elastic run --rm elastic
+docker compose --profile pipeline run --rm pipeline
+```
+
+`elastic.py` also reads the same values as CLI flags (`--topic-label`,
+`--start-date`, `--end-date`, `--days`, `--topic-query`, `--auth`,
+`--max-scan-docs`). `POST /api/v1/pipeline/runs` with `"fetch": true` runs
+this script inside the `api` container, so it needs the same cert and VPN.
+
+`make docker-elastic` exits early with a short message if the cert file is
+missing. The fetch cannot work off-network; for UI work, copy generated
+`dashboard_*.html` / `communities/*.json` from a machine that already ran
+the pipeline.
+
 ## Usage
 
 - Run notebooks for data collection, graph building, and community detection.

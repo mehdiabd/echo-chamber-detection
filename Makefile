@@ -42,4 +42,16 @@ docker-pipeline: docker-env
 	docker compose --profile pipeline run --rm pipeline
 
 docker-elastic: docker-env
+	@cert=ca.crt; \
+	if grep -Eq '^[[:space:]]*ELASTIC_AUTH=2[[:space:]]*$$' .env 2>/dev/null; then \
+		cert=http_ca.crt; \
+	fi; \
+	if [ ! -f "$$cert" ]; then \
+		echo "Missing $$cert in the project root (git ignores *.crt)."; \
+		echo "Auth 1 (default): https://192.168.59.79:9200 needs ca.crt"; \
+		echo "Auth 2: https://192.168.59.26:9200 needs http_ca.crt"; \
+		echo "The host must reach that Elasticsearch over VPN/LAN, then:"; \
+		echo "  make docker-elastic && make docker-pipeline"; \
+		exit 1; \
+	fi
 	docker compose --profile elastic run --rm elastic

@@ -6,9 +6,39 @@
 قرارداد زنده (Swagger): [http://localhost:8765/docs](http://localhost:8765/docs)  
 OpenAPI برای Postman: [http://localhost:8765/openapi.json](http://localhost:8765/openapi.json) → Import → Link
 
+---
+
+## راه‌اندازی با Docker
+
+`make docker-up` **فقط API را بالا می‌آورد.** Elasticsearch داخل این استک نیست و داشبوردها هم در git نیستند (`*.html` / `*.json`). برای سیم‌کشی فرانت همین کافی است: `/docs` و `/health` باید جواب بدهند حتی اگر لیست داشبورد خالی باشد.
+
 ```bash
-make docker-up    # یا: make api
+cp .env.example .env          # اگر .env نداری
+make docker-up                # API روی :8765
+open http://localhost:8765/docs
 ```
+
+بدون Makefile، `docker compose up` دیگر به‌خاطر نبود `.env` نمی‌ترکد؛ باز هم `make docker-up` را ترجیح بده چون `.env` را می‌سازد.
+
+### داده از کجا می‌آید؟
+
+سه راه، به ترتیب ساده‌به‌سخت:
+
+1. **کپی آرتیفکت از ماشینی که پایپلاین را ران کرده** (بهترین برای فرانت): `timeline_dashboard.html`، چند `dashboard_*.html` + `hybrid_graph_*.html` + `*_legend.json`، `communities/hybrid_report_*.json`، و در صورت نیاز `lib/bindings/utils.js`. بعد دوباره `make docker-up`. API همان فایل‌ها را از ریشهٔ پروژه می‌خواند.
+2. **واکشی از Elasticsearch و ساخت داشبورد** — فقط روی شبکه/VPN سازمان، با فایل گواهی:
+   ```bash
+   # ELASTIC_AUTH=1 → ca.crt و https://192.168.59.79:9200
+   # ELASTIC_AUTH=2 → http_ca.crt و https://192.168.59.26:9200
+   # در .env: TOPIC_LABEL, START_DATE, END_DATE یا LOOKBACK_DAYS
+   make docker-elastic     # می‌نویسد interactions.json و res.json و pipeline_config.json
+   make docker-pipeline    # از آن فایل‌ها HTML/گزارش می‌سازد
+   ```
+   یا از خود API: `POST /api/v1/pipeline/runs` با `"fetch": true, "detect": true` — همان `elastic.py` را داخل کانتینر `api` اجرا می‌کند و همان گواهی/VPN را می‌خواهد.
+3. **بدون داده کار کردن:** `/docs` و قرارداد API برای پیاده‌سازی UI کافی است؛ `GET /api/v1/dashboards` تا وقتی آرتیفکت نباشد `[]` برمی‌گردد.
+
+`make docker-elastic` اگر `ca.crt` / `http_ca.crt` نباشد عمداً خطا می‌دهد. این فایل‌ها gitignore شده‌اند؛ باید جداگانه کنار پروژه گذاشته شوند.
+
+جزئیات CLIی `elastic.py`: موضوع، بازهٔ تاریخ، و خروجی‌ها در [README.md](README.md#elasticsearch-data-fetch).
 
 ---
 
@@ -20,6 +50,7 @@ make docker-up    # یا: make api
 | نمونهٔ UI تایم‌لاین (استاتیک) | `timeline_dashboard.html` + `timeline_template.html` |
 | گراف یک اسلات | `dashboard_*.html` → iframe به `hybrid_graph_*.html` |
 | اجرای API | `make docker-up` یا `make api` |
+| گرفتن داده از Elastic | `make docker-elastic` سپس `make docker-pipeline` (VPN + `ca.crt`) |
 | توکن اختیاری | `.env` → `ECHO_API_TOKEN` یا `PARTY_CHANGE_API_TOKEN` |
 | تست قرارداد API | `tests/test_echo_chamber_api.py` |
 
