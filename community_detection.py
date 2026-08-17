@@ -724,6 +724,63 @@ def apply_edge_widths(net, g, min_width=0.5, max_width=6.0):
         edge["title"] = f"وزن تعامل: {weight}"
 
 
+def serialize_hybrid_graph(g, partition=None):
+    """JSON nodes/edges for the API (vis-network compatible from/to)."""
+    partition = partition or {}
+    nodes = []
+    for node in sorted(g.nodes(), key=lambda value: str(value)):
+        comm_id = partition.get(node)
+        if comm_id is None:
+            community = None
+        elif isinstance(comm_id, (int, np.integer)):
+            community = int(comm_id)
+        else:
+            community = comm_id
+        comm_label = (
+            g.nodes[node].get("community_label_hybrid")
+            or g.nodes[node].get("community_label")
+        )
+        degree = int(g.degree(node))
+        nodes.append({
+            "id": str(node),
+            "label": str(node),
+            "community": community,
+            "community_label": comm_label,
+            "color": get_community_label_color(comm_label) if comm_label else None,
+            "degree": degree,
+            "size": 15 + min(degree * 2, 25),
+        })
+    edges = []
+    for u, v, data in g.edges(data=True):
+        left, right = sorted((str(u), str(v)))
+        weight = data.get("weight", 1)
+        try:
+            weight = int(weight)
+        except (TypeError, ValueError):
+            weight = 1
+        edges.append({
+            "id": f"{left}|{right}",
+            "from": left,
+            "to": right,
+            "weight": weight,
+        })
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "node_count": len(nodes),
+        "edge_count": len(edges),
+    }
+
+
+def save_hybrid_graph_json(g, partition, hybrid_html):
+    path = hybrid_html.replace(".html", ".json")
+    payload = serialize_hybrid_graph(g, partition)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(sanitize_json(payload), handle, ensure_ascii=False)
+    print(f"[saved] {path}")
+    return path
+
+
 # --- Helper: Extract recent texts from Elasticsearch or file ---
 def get_recent_texts(center_node: str, max_samples: int = 3, max_chars: int = 300):
     """Get sample texts from a center node's recent activity."""
@@ -2192,6 +2249,15 @@ def visualize_or_dummy(slot_start, slot_end, g, louvain=None, hybrid=None, slot_
     mode_part = f"{slot_mode}_" if slot_mode else ""
     filename = f"dashboard_{mode_part}{start_str}_to_{end_str}.html"
     legend_path = filename.replace(".html", "_legend.json")
+
+    # Drop the previous run's graph JSON so a failed slot never serves it.
+    stale_graph_json = filename.replace("dashboard_", "hybrid_graph_").replace(
+        ".html", ".json"
+    )
+    try:
+        os.remove(stale_graph_json)
+    except OSError:
+        pass
     
     # Initialize empty partitions if needed
     if g.number_of_nodes() == 0:
@@ -2430,6 +2496,7 @@ def visualize_combined_dashboard(g, louvain_partition, hybrid_partition, filenam
         with open(legend_path, 'w', encoding='utf-8') as f:
             json.dump(empty_data, f, ensure_ascii=False, indent=2)
         save_network_html(net2, hybrid_html)
+        save_hybrid_graph_json(g, hybrid_partition, hybrid_html)
         print(f"[saved] {hybrid_html}, {legend_path}")
         return
 
@@ -2438,6 +2505,7 @@ def visualize_combined_dashboard(g, louvain_partition, hybrid_partition, filenam
     hybrid_colors = style_partition(g, net2, hybrid_partition, "hybrid", 200)
 
     save_network_html(net2, hybrid_html)
+    save_hybrid_graph_json(g, hybrid_partition, hybrid_html)
     print(f"[saved] {hybrid_html}")
 
     # Save only the user-facing community-level similarity graph.

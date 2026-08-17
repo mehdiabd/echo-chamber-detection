@@ -139,6 +139,26 @@ def format_slot_token(raw: str) -> str:
     return dt.strftime("%Y-%m-%d")
 
 
+def load_graph_json(path: Path | None) -> dict[str, Any]:
+    """Read the nodes/edges written by the pipeline next to the hybrid graph."""
+    payload: Any = None
+    if path is not None:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = None
+    if not isinstance(payload, dict):
+        payload = {}
+    nodes = [item for item in payload.get("nodes") or [] if isinstance(item, dict)]
+    edges = [item for item in payload.get("edges") or [] if isinstance(item, dict)]
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "node_count": len(nodes),
+        "edge_count": len(edges),
+    }
+
+
 def slot_tokens_from_timeframe(start: str, end: str) -> tuple[str, str] | None:
     start = str(start or "").strip()
     end = str(end or "").strip()
@@ -738,6 +758,7 @@ class ArtifactIndex:
             slot_id = f"{mode}_{start_token}_to_{end_token}"
             legend_path = self.root / path.name.replace(".html", "_legend.json")
             hybrid_graph = self.root / path.name.replace("dashboard_", "hybrid_graph_")
+            graph_json = hybrid_graph.with_suffix(".json")
             legends = {"hybrid": {"groups": {}}}
             if legend_path.exists():
                 try:
@@ -762,6 +783,7 @@ class ArtifactIndex:
                     "dashboard": path.name,
                     "legend": legend_path.name if legend_path.exists() else None,
                     "hybrid_graph": hybrid_graph.name if hybrid_graph.exists() else None,
+                    "graph_json": graph_json.name if graph_json.exists() else None,
                     "has_legend": legend_path.exists(),
                     "legends": legends,
                 }
@@ -789,12 +811,21 @@ class ArtifactIndex:
         for item in self.list_dashboards_raw():
             if item["id"] == wanted or item["dashboard"] == wanted:
                 payload = dict(item)
+                graph_name = item.get("graph_json")
+                payload["graph"] = load_graph_json(
+                    self.root / graph_name if graph_name else None
+                )
                 payload["files"] = {
                     "dashboard": f"/api/v1/files/{item['dashboard']}",
                     "legend": f"/api/v1/files/{item['legend']}" if item.get("legend") else None,
                     "hybrid_graph": (
                         f"/api/v1/files/{item['hybrid_graph']}"
                         if item.get("hybrid_graph")
+                        else None
+                    ),
+                    "graph": (
+                        f"/api/v1/files/{item['graph_json']}"
+                        if item.get("graph_json")
                         else None
                     ),
                 }

@@ -77,6 +77,22 @@ def write_dashboard(root: Path):
     (root / "hybrid_graph_daily_260101_to_260102.html").write_text(
         "<html>graph</html>", encoding="utf-8"
     )
+    (root / "hybrid_graph_daily_260101_to_260102.json").write_text(
+        json.dumps(
+            {
+                "nodes": [
+                    {"id": "alice", "label": "alice", "community": 0, "color": "#2563eb"},
+                    {"id": "bob", "label": "bob", "community": 0, "color": "#2563eb"},
+                    {"id": "carol", "label": "carol", "community": 1, "color": "#16a34a"},
+                ],
+                "edges": [
+                    {"from": "alice", "to": "bob", "weight": 2},
+                    {"from": "bob", "to": "carol", "weight": 1},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def party_event(event_id="event-1", node_id="alice"):
@@ -137,6 +153,21 @@ class ArtifactIndexTests(unittest.TestCase):
         detail = self.index.get_dashboard("daily_260101_to_260102")
         self.assertEqual(detail["slot_mode"], "daily")
         self.assertEqual(detail["legends"]["hybrid"]["groups"]["alice"], 0)
+        self.assertEqual(detail["graph"]["node_count"], 3)
+        self.assertEqual(detail["graph"]["edge_count"], 2)
+        self.assertEqual(detail["graph"]["nodes"][0]["id"], "alice")
+        self.assertEqual(detail["graph"]["edges"][0]["from"], "alice")
+        self.assertEqual(
+            detail["files"]["graph"],
+            "/api/v1/files/hybrid_graph_daily_260101_to_260102.json",
+        )
+
+    def test_dashboard_graph_empty_without_json(self):
+        (self.root / "hybrid_graph_daily_260101_to_260102.json").unlink()
+        detail = self.index.get_dashboard("daily_260101_to_260102")
+        self.assertEqual(detail["graph"]["nodes"], [])
+        self.assertEqual(detail["graph"]["edge_count"], 0)
+        self.assertIsNone(detail["files"]["graph"])
 
     def test_rejects_path_traversal_for_files(self):
         with self.assertRaises(ValueError):
@@ -394,6 +425,8 @@ class ApiServerTests(unittest.TestCase):
         self.assertEqual(dashboards["dashboards"][0]["id"], "daily_260101_to_260102")
         slot = self.request("GET", "/api/v1/dashboards/daily_260101_to_260102")
         self.assertIn("alice", slot["legends"]["hybrid"]["groups"])
+        self.assertEqual(slot["graph"]["node_count"], 3)
+        self.assertEqual(slot["graph"]["edges"][0]["from"], "alice")
         topics = self.request("GET", "/api/v1/topics")
         labels = {item["label"] for item in topics["topics"]}
         self.assertIn("جنگ", labels)

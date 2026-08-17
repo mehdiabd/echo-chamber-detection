@@ -98,12 +98,25 @@ open http://localhost:8765/docs
   "files": {
     "dashboard": "/api/v1/files/dashboard_daily_260101_to_260102.html",
     "legend": "/api/v1/files/dashboard_daily_260101_to_260102_legend.json",
-    "hybrid_graph": "/api/v1/files/hybrid_graph_daily_260101_to_260102.html"
+    "hybrid_graph": "/api/v1/files/hybrid_graph_daily_260101_to_260102.html",
+    "graph": "/api/v1/files/hybrid_graph_daily_260101_to_260102.json"
+  },
+  "graph": {
+    "node_count": 3,
+    "edge_count": 2,
+    "nodes": [
+      {"id": "alice", "label": "alice", "community": 0, "community_label": "اصولگرا", "color": "#2563eb", "degree": 2, "size": 19}
+    ],
+    "edges": [
+      {"id": "alice|bob", "from": "alice", "to": "bob", "weight": 2}
+    ]
   }
 }
 ```
 
-گراف فعلی با iframe از `files.hybrid_graph` یا `files.dashboard` لود می‌شود. `hybrid_graph_*.html` از CDN (`vis-network` و Bootstrap) و `lib/bindings/utils.js` استفاده می‌کند؛ اگر همان گراف را نشان می‌دهی، از ریشه سرو کن.
+برای رندر گراف در React از `graph.nodes` و `graph.edges` استفاده کن (`from` / `to` سازگار با vis-network). فایل HTML دیگر لازم نیست. این JSON را پایپلاین کنار HTML گراف می‌نویسد؛ آرتیفکت‌های قدیمی که `hybrid_graph_*.json` ندارند `graph.nodes` خالی می‌دهند و باید پایپلاین دوباره اجرا شود (HTML را scrape نکن).
+
+گراف HTML هنوز در `files.hybrid_graph` هست اگر iframe بخواهی. `hybrid_graph_*.html` از CDN (`vis-network` و Bootstrap) و `lib/bindings/utils.js` استفاده می‌کند؛ اگر همان گراف را نشان می‌دهی، از ریشه سرو کن.
 
 **نیست در API:** سایدبار `partyFocus` فقط داخل HTML بaked است. اگر همان سایدبار را می‌خواهی، از HTML نمونه بخوان یا بعداً فیلد جدا به API اضافه می‌شود.
 
@@ -190,6 +203,7 @@ open http://localhost:8765/docs
 | `timeline_dashboard.html` | خروجی نهایی با دادهٔ embed |
 | `dashboard_<mode>_<start>_to_<end>.html` | پوستهٔ یک اسلات |
 | `hybrid_graph_<mode>_<start>_to_<end>.html` | گراف vis-network |
+| `hybrid_graph_<mode>_<start>_to_<end>.json` | nodes/edges همان گراف برای رندر در React |
 | `dashboard_*_legend.json` | رنگ/حزب/تعداد |
 | `lib/bindings/utils.js` | تعامل گراف؛ بدون این iframe می‌شکند |
 
@@ -213,5 +227,5 @@ open http://localhost:8765/docs
 2. Import کردن `/openapi.json` در Postman
 3. اگر توکن دارید: Authorize در Swagger
 4. برای تایم‌لاین: `topics` → `dashboards` → `dashboards/{id}` → `files/...`
-5. گراف را با iframe از `files.hybrid_graph` نشان بده
+5. گراف را از `graph.nodes` و `graph.edges` بکش (iframe از `files.hybrid_graph` فقط جایگزین است)
 6. `partyFocus` را از API انتظار نداشته باش
