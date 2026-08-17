@@ -1,4 +1,7 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import networkx as nx
@@ -85,6 +88,48 @@ class CommunityNamingPipelineTests(unittest.TestCase):
         self.assertEqual(label, "اصولگرا")
         mocked_llm_chain.assert_called_once()
         mocked_save.assert_called_once()
+
+    def test_party_focus_splits_type_and_handle(self):
+        messages = [
+            {"sender": "alice", "target": "CENTCOM", "type": "quote"},
+            {"sender": "alice", "target": "PMN_Amy", "type": "mention"},
+            {"sender": "bob", "target": "alice", "type": "mention"},
+        ]
+        meta_map = {
+            "alice": {"political_label": "زن زندگی آزادی"},
+            "bob": {"political_label": "اصولگرا"},
+        }
+        payload = community_detection.build_party_focus_for_messages(
+            messages, meta_map
+        )
+        by_name = {party["name"]: party for party in payload["parties"]}
+        freedom = by_name["جریان زن‌زندگی‌آزادی"]
+        self.assertEqual(freedom["stats"], {"total": 3, "outgoing": 2, "incoming": 1})
+        self.assertEqual(
+            freedom["top_interactions"],
+            [
+                {"type": "نقل‌قول", "handle": "@CENTCOM", "count": 1},
+                {"type": "ذکر", "handle": "@PMN_Amy", "count": 1},
+                {"type": "ذکر", "handle": "@bob", "count": 1},
+            ],
+        )
+        self.assertEqual(by_name["اصولگرا"]["stats"]["outgoing"], 1)
+        self.assertEqual(by_name["اصولگرا"]["stats"]["incoming"], 0)
+
+    def test_party_focus_is_written_into_hybrid_graph_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            graph_path = root / "hybrid_graph_daily_260101_to_260102.json"
+            graph_path.write_text(
+                json.dumps({"nodes": [], "edges": []}), encoding="utf-8"
+            )
+            community_detection.attach_party_focus_to_graph_json(
+                str(root / "dashboard_daily_260101_to_260102.html"),
+                {"parties": [{"name": "اصولگرا", "stats": {"total": 1}}]},
+            )
+            saved = json.loads(graph_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["nodes"], [])
+            self.assertEqual(saved["partyFocus"]["parties"][0]["name"], "اصولگرا")
 
 
 if __name__ == "__main__":

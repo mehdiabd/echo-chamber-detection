@@ -2113,13 +2113,26 @@ def infer_interaction_topic(msg, counterpart):
     return interaction_type
 
 
+def interaction_handle(account):
+    text = str(account or "").strip()
+    if not text:
+        return ""
+    return text if text.startswith("@") else f"@{text}"
+
+
 def build_party_focus_for_messages(messages, meta_map, top_n=6):
     """Summarize selected political groups across interaction axes for one slot."""
+    type_labels = {
+        "mention": "ذکر",
+        "quote": "نقل‌قول",
+        "repost": "بازنشر",
+        "reply": "پاسخ",
+    }
     parties = defaultdict(lambda: {
         "total": 0,
         "incoming": 0,
         "outgoing": 0,
-        "topics": Counter(),
+        "interactions": Counter(),
     })
 
     for msg in messages:
@@ -2127,36 +2140,63 @@ def build_party_focus_for_messages(messages, meta_map, top_n=6):
         target = msg.get("target")
         sender_party = get_account_party(sender, meta_map)
         target_party = get_account_party(target, meta_map)
+        interaction_type = type_labels.get(str(msg.get("type") or "").lower(), "تعامل")
 
         if sender_party:
-            topic = infer_interaction_topic(msg, target)
             parties[sender_party]["total"] += 1
             parties[sender_party]["outgoing"] += 1
-            parties[sender_party]["topics"][topic] += 1
+            handle = interaction_handle(target)
+            if handle:
+                parties[sender_party]["interactions"][(interaction_type, handle)] += 1
 
         if target_party and target_party != sender_party:
-            topic = infer_interaction_topic(msg, sender)
             parties[target_party]["total"] += 1
             parties[target_party]["incoming"] += 1
-            parties[target_party]["topics"][topic] += 1
+            handle = interaction_handle(sender)
+            if handle:
+                parties[target_party]["interactions"][(interaction_type, handle)] += 1
 
     return {
-        party: {
-            "total": data["total"],
-            "incoming": data["incoming"],
-            "outgoing": data["outgoing"],
-            "topics": [
-                {"label": label, "count": count}
-                for label, count in data["topics"].most_common(top_n)
-            ],
-        }
-        for party, data in sorted(
-            parties.items(),
-            key=lambda item: item[1]["total"],
-            reverse=True,
-        )
-        if data["total"] > 0
+        "parties": [
+            {
+                "name": party,
+                "stats": {
+                    "total": data["total"],
+                    "outgoing": data["outgoing"],
+                    "incoming": data["incoming"],
+                },
+                "top_interactions": [
+                    {"type": itype, "handle": handle, "count": count}
+                    for (itype, handle), count in data["interactions"].most_common(top_n)
+                ],
+            }
+            for party, data in sorted(
+                parties.items(),
+                key=lambda item: item[1]["total"],
+                reverse=True,
+            )
+            if data["total"] > 0
+        ]
     }
+
+
+def attach_party_focus_to_graph_json(dashboard_file, party_focus):
+    """Persist the party panel next to nodes/edges in hybrid_graph_*.json."""
+    if not dashboard_file:
+        return
+    path = dashboard_file.replace("dashboard_", "hybrid_graph_").replace(
+        ".html", ".json"
+    )
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(payload, dict):
+        return
+    payload["partyFocus"] = party_focus
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(sanitize_json(payload), handle, ensure_ascii=False)
 
 
 def collect_node_party_changes(
@@ -3652,11 +3692,13 @@ if __name__ == "__main__":
                     post_party_change_events(party_changes)
 
             if dashboard_file:
+                party_focus = build_party_focus_for_messages(messages, meta_map)
+                attach_party_focus_to_graph_json(dashboard_file, party_focus)
                 mode_dashboards[slot_mode].append({
                     "file": dashboard_file,
                     "start": format_slot_value(slot_start, slot_mode),
                     "end": format_slot_value(slot_end, slot_mode),
-                    "party_focus": build_party_focus_for_messages(messages, meta_map),
+                    "party_focus": party_focus,
                 })
 
     print("[done] Community detection completed.")
