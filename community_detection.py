@@ -1,8 +1,10 @@
 """Community Detection on Sample Social Graph via NetworkX and community-louvain"""
 import re
 import json
-from collections import defaultdict
-import ollama
+import csv
+import hashlib
+from collections import defaultdict, Counter
+from urllib.parse import quote, unquote
 import requests
 import os
 from typing import Dict, Any, List
@@ -12,11 +14,159 @@ import community as community_louvain
 import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.decomposition import PCA
+from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score, silhouette_score
 from node2vec import Node2Vec
+from cleanup_root import clean_project_root
+from community_naming import (
+    DEFAULT_COMMUNITY_LABEL,
+    build_community_classification_prompt,
+    build_community_profile,
+    coerce_allowed_label,
+    get_community_label_color,
+    parse_community_classification_response,
+)
+from elastic_query import DEFAULT_LOOKBACK_DAYS
+from llm_client import call_llm_with_fallback
+
+
+def env_flag(name, default=False):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def env_int(name, default):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {value!r}") from exc
+
+
+COMMUNITY_RANDOM_SEED = env_int("COMMUNITY_RANDOM_SEED", 42)
+
+
+ENABLE_LLM_NAMING = env_flag("ENABLE_LLM_NAMING", default=True)
+ENABLE_NAMING_TEXT_FETCH = env_flag(
+    "ENABLE_NAMING_TEXT_FETCH",
+    default=ENABLE_LLM_NAMING,
+)
+
+# ---- Echo Chamber Metrics ----
+
+def compute_ei_index(g, community_nodes):
+    """
+    E-I Index = (E - I) / (E + I)
+    E: edges from community to outside
+    I: edges within community
+    Range: [-1, +1]
+    """
+    internal_edges = 0
+    external_edges = 0
+    community_set = set(community_nodes)
+
+    for u in community_nodes:
+        for v in g.neighbors(u):
+            if v in community_set:
+                internal_edges += 1
+            else:
+                external_edges += 1
+
+    # each internal edge counted twice
+    internal_edges /= 2
+    total = internal_edges + external_edges
+    if total == 0:
+        return 0.0
+    return (external_edges - internal_edges) / total
+
+
+def compute_conductance(g, community_nodes):
+    """
+    Conductance = cut(S, V-S) / min(vol(S), vol(V-S))
+    Lower value => more isolated community
+    """
+    community_set = set(community_nodes)
+    cut_edges = 0
+    vol_s = 0
+    vol_rest = 0
+
+    for u in g.nodes():
+        deg_u = g.degree(u)
+        if u in community_set:
+            vol_s += deg_u
+            for v in g.neighbors(u):
+                if v not in community_set:
+                    cut_edges += 1
+        else:
+            vol_rest += deg_u
+
+    denom = min(vol_s, vol_rest)
+    if denom == 0:
+        return 0.0
+    return cut_edges / denom
+
+
+DEFAULT_ECHO_THRESHOLDS = {
+    # Structural isolation
+    "ei_index_max": -0.2,   # lower (more negative) => more internal ties
+    "conductance_max": 0.3, # lower => more isolated
+    # Content homogeneity
+    "homogeneity_min": 0.6, # dominant stance share
+    # Size guardrail
+    "min_size": 5,
+}
+
+
+def compute_content_homogeneity(stance_info):
+    """Return dominant stance share based on stance_info counts."""
+    if not stance_info:
+        return None
+    counts = stance_info.get("counts") or {}
+    total = counts.get("total", 0) or 0
+    if total <= 0:
+        return None
+    return max(counts.get("pos", 0), counts.get("neg", 0), counts.get("neu", 0)) / total
+
+
+def classify_echo_chamber(ei_index, conductance, homogeneity, size, thresholds=None):
+    """Classify echo chamber based on structural + content thresholds."""
+    th = dict(DEFAULT_ECHO_THRESHOLDS)
+    if thresholds:
+        th.update(thresholds)
+    if size is None or size < th["min_size"]:
+        return False
+    if ei_index is None or conductance is None:
+        return False
+    if ei_index > th["ei_index_max"]:
+        return False
+    if conductance > th["conductance_max"]:
+        return False
+    if homogeneity is None or homogeneity < th["homogeneity_min"]:
+        return False
+    return True
+
+
+def compute_temporal_stability(prev_partition, curr_partition):
+    """
+    Compute AMI and NMI between two partitions
+    """
+    common_nodes = set(prev_partition.keys()) & set(curr_partition.keys())
+    if len(common_nodes) < 2:
+        return {"AMI": None, "NMI": None}
+
+    prev_labels = [prev_partition[n] for n in common_nodes]
+    curr_labels = [curr_partition[n] for n in common_nodes]
+
+    return {
+        "AMI": adjusted_rand_score(prev_labels, curr_labels),
+        "NMI": normalized_mutual_info_score(prev_labels, curr_labels)
+    }
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
-from elastic import es, INDEX, log as es_log
-from elasticsearch.helpers import scan
+from elastic_client import es, INDEX
 
 
 def fetch_community_texts(accounts: List[str], start_date: str = None,
@@ -24,16 +174,16 @@ def fetch_community_texts(accounts: List[str], start_date: str = None,
     """Fetch recent texts for a list of accounts from Elasticsearch.
 
     Robust behavior:
-    - Reuse `es` and `INDEX` from elastic.py
+    - Reuse `es` and `INDEX` from elastic_client.py
     - Try username fields: user_name.keyword, user_name, sender.keyword, sender
     - Prefer `normalized_text` then fallback to `text`/`content`
     - Try sorting by `date` but fall back to unsorted if mapping missing
     - Print a 3-item debug preview for the first account (center) so we can verify
     """
     try:
-        es_client = es  # from elastic.py import
+        es_client = es
     except Exception:
-        raise RuntimeError("Elasticsearch client `es` not available from elastic.py")
+        raise RuntimeError("Elasticsearch client `es` not available from elastic_client.py")
 
     index = INDEX
     username_fields = ["user_name.keyword", "user_name", "sender.keyword", "sender"]
@@ -85,74 +235,550 @@ def fetch_community_texts(accounts: List[str], start_date: str = None,
 
 
 _ai_name_cache = {}
+META_FIELDS = {
+    "political_label": "گرایش سیاسی",
+    "category": "موضوع",
+    "emotion": "احساس",
+    "sentiment": "حس",
+    "language": "زبان"
+}
+
+STANCE_TARGETS = {
+    "رهبری": ["رهبری", "رهبر", "خامنه", "khamenei", "khamenei_ir"]
+}
+
+SENTIMENT_MAP = {
+    "positive": "pos",
+    "pos": "pos",
+    "مثبت": "pos",
+    "negative": "neg",
+    "neg": "neg",
+    "منفی": "neg",
+    "neutral": "neu",
+    "neu": "neu",
+    "خنثی": "neu",
+    "مختلط": "neu"
+}
+
+POS_CUES = [
+    "حامی", "حمایت", "زنده باد", "درود", "قهرمان", "افتخار",
+    "عالی", "خوب", "مثبت", "درست", "حق", "همراهی"
+]
+
+NEG_CUES = [
+    "مرگ بر", "لعنت", "نفرت", "ننگ", "خائن", "دیکتاتور",
+    "بد", "افتضاح", "فاسد", "کثیف", "منفور", "مجرم",
+    "محاکمه", "اعدام", "اعتراض"
+]
 
 
-# --- Detect company LLM
-try:
-    resp = requests.get("http://192.168.59.239:8002/v1/models", timeout=5)
-    ORG_LLM_MODEL = resp.json()["data"][0]["id"]
-    ORG_LLM_URL = "http://192.168.59.239:8002/v1/chat/completions"
-    print(f"[Org LLM] Running model: {ORG_LLM_MODEL}")
-except Exception as e:
-    ORG_LLM_MODEL = None
-    ORG_LLM_URL = None
-    print(f"[Org LLM] Not available → {e}")
+def iter_res_documents(file_path="res.json"):
+    """Yield docs from res.json (supports JSON array or JSON lines)."""
+    if not os.path.exists(file_path):
+        return
+    with open(file_path, "r", encoding="utf-8") as f:
+        first_char = None
+        while first_char is None:
+            ch = f.read(1)
+            if not ch:
+                break
+            if not ch.isspace():
+                first_char = ch
+        f.seek(0)
+        if first_char == "[":
+            try:
+                data = json.load(f)
+            except json.JSONDecodeError:
+                data = []
+            if isinstance(data, list):
+                for doc in data:
+                    if isinstance(doc, dict):
+                        yield doc
+        else:
+            for line in f:
+                try:
+                    doc = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(doc, dict):
+                    yield doc
 
 
-def call_llm(prompt: str, backend="org", temperature: float = 0.6, max_tokens: int = 60):
-    """
-    Generic LLM caller with temperature control.
-    backend: "org" or "local_llama"
-    temperature: creativity control (0.0 - 1.0)
-    """
-    if backend == "org":
-        if not ORG_LLM_MODEL or not ORG_LLM_URL:
-            return None
-        try:
-            payload = {
-                "model": ORG_LLM_MODEL,
-                "messages": [
-                    {"role": "system", "content": "شما یک متخصص در نام‌گذاری جوامع و گروه‌های اجتماعی هستید."},
-                    {"role": "user", "content": prompt}
-                ],
-                "temperature": temperature,
-                "max_tokens": max_tokens
-            }
-            resp = requests.post(ORG_LLM_URL, json=payload, timeout=30)
-            data = resp.json()
-            # defensive path for different response shapes
-            if isinstance(data, dict) and "choices" in data:
-                return data["choices"][0]["message"]["content"].strip()
-            if isinstance(data, dict) and "result" in data:
-                return data["result"].strip()
-            return None
-        except Exception as e:
-            print(f"[Org LLM] Failed → {e}")
-            return None
-    elif backend == "local_llama":
-        try:
-            response = ollama.chat(
-                model="llama3.1",
-                messages=[
-                    {"role": "system", "content": "تو یک متخصص در نام‌گذاری جوامع و گروه‌های اجتماعی هستی."},
-                    {"role": "user", "content": prompt}
-                ],
-                options={"temperature": temperature, "num_predict": max_tokens}
-            )
-            return response['message']['content'].strip()
-        except Exception as e:
-            print(f"[Local Llama] Failed → {e}")
-            return None
+def normalize_sentiment(value):
+    """Normalize sentiment labels to pos/neg/neu."""
+    if not value:
+        return None
+    return SENTIMENT_MAP.get(str(value).strip().lower())
+
+
+def infer_sentiment_from_text(text):
+    """Lightweight lexicon-based sentiment inference."""
+    if not text:
+        return None
+    lower_text = str(text).lower()
+    pos_hits = sum(1 for cue in POS_CUES if cue in lower_text)
+    neg_hits = sum(1 for cue in NEG_CUES if cue in lower_text)
+    if pos_hits == 0 and neg_hits == 0:
+        return "neu"
+    if pos_hits > neg_hits:
+        return "pos"
+    if neg_hits > pos_hits:
+        return "neg"
+    return "neu"
+
+
+def load_user_context(file_path="res.json"):
+    """Load user-level metadata and stance signals from res.json."""
+    if not os.path.exists(file_path):
+        print(f"[meta] {file_path} not found; skipping metadata load.")
+        return {}, {}
+
+    meta_counts = defaultdict(lambda: {field: Counter() for field in META_FIELDS})
+    stance_map = defaultdict(lambda: defaultdict(Counter))
+    for doc in iter_res_documents(file_path):
+        username = doc.get("user_name") or doc.get("sender")
+        if not username:
+            continue
+        for field in META_FIELDS:
+            value = doc.get(field)
+            if value:
+                val_norm = str(value).strip()
+                if val_norm.lower() in {"unknown", "نامشخص", "none", "null"}:
+                    continue
+                meta_counts[username][field][val_norm] += 1
+
+        text = doc.get("normalized_text") or doc.get("content") or ""
+        sentiment_raw = doc.get("sentiment") or doc.get("sentiment.label")
+        sentiment = normalize_sentiment(sentiment_raw)
+        if not sentiment:
+            sentiment = infer_sentiment_from_text(text)
+        if text and sentiment:
+            stance_map[username]["__topic__"][sentiment] += 1
+            lower_text = str(text).lower()
+            for target, keywords in STANCE_TARGETS.items():
+                if any(k.lower() in lower_text for k in keywords):
+                    stance_map[username][target][sentiment] += 1
+
+    meta_map = {}
+    for username, counts in meta_counts.items():
+        meta_map[username] = {
+            field: (counter.most_common(1)[0][0] if counter else None)
+            for field, counter in counts.items()
+        }
+
+    print(f"[meta] Loaded metadata for {len(meta_map)} users.")
+    return meta_map, stance_map
+
+
+def attach_metadata_to_graph(g, meta_map, stance_map=None, topic_label=None):
+    """Attach metadata to graph for tooltip and community analysis."""
+    if not meta_map and not stance_map:
+        return
+    if meta_map:
+        g.graph["meta_map"] = meta_map
+    for node in g.nodes():
+        meta = meta_map.get(node)
+        if meta:
+            g.nodes[node]["meta"] = meta
+    if stance_map:
+        g.graph["stance_map"] = stance_map
+    if topic_label:
+        g.graph["topic_label"] = topic_label
+
+
+def normalize_method_key(method):
+    """Normalize visualization method names for graph-level label storage."""
+    return str(method or "unknown").strip().lower()
+
+
+def get_stored_community_profile(g, method, comm_id):
+    """Return a saved method-specific community profile from the graph."""
+    if g is None:
+        return None
+    method_key = normalize_method_key(method)
+    store = g.graph.get("community_profiles", {})
+    method_profiles = store.get(method_key, {})
+    return (
+        method_profiles.get(str(comm_id)) or
+        method_profiles.get(comm_id)
+    )
+
+
+def get_stored_community_label(g, method, comm_id, node=None):
+    """Return a saved method-specific community label."""
+    profile = get_stored_community_profile(g, method, comm_id)
+    if isinstance(profile, dict) and profile.get("label"):
+        return profile["label"]
+
+    if g is not None and node in g.nodes:
+        method_key = normalize_method_key(method)
+        method_label = g.nodes[node].get(f"community_label_{method_key}")
+        if method_label:
+            return method_label
+        if method_key == "unknown":
+            return g.nodes[node].get("community_label")
+    return None
+
+
+def save_community_profile_to_graph(g, method, comm_id, members, profile):
+    """Save method-specific profile data for dashboard styling and reports."""
+    if g is None or not profile:
+        return
+    method_key = normalize_method_key(method)
+    graph_profiles = g.graph.setdefault("community_profiles", {})
+    method_profiles = graph_profiles.setdefault(method_key, {})
+    method_profiles[str(comm_id)] = {
+        "label": profile.name,
+        "confidence": profile.confidence,
+        "reasoning": profile.reasoning,
+        "description": profile.description,
+    }
+    for node in members:
+        if node in g.nodes:
+            g.nodes[node][f"community_label_{method_key}"] = profile.name
+            g.nodes[node][f"community_confidence_{method_key}"] = profile.confidence
+
+
+def fallback_label_from_metadata(members, meta_map):
+    """Pick an allowed fallback label from members' dominant political tags."""
+    if not meta_map:
+        return DEFAULT_COMMUNITY_LABEL
+
+    counts = Counter()
+    for member in members:
+        meta = meta_map.get(member, {})
+        for field in ("political_label", "politic_group"):
+            label = coerce_allowed_label(meta.get(field))
+            if label:
+                counts[label] += 1
+                break
+
+    if not counts:
+        return DEFAULT_COMMUNITY_LABEL
+    return counts.most_common(1)[0][0]
+
+
+def validate_llm_community_label(candidate, dominant_political_label):
+    """Reject a gray LLM result when member metadata has a specific label."""
+    parsed = parse_community_classification_response(candidate, default=None)
+    if not parsed:
+        return None
+    if (
+        parsed["selected_label"] == DEFAULT_COMMUNITY_LABEL
+        and dominant_political_label != DEFAULT_COMMUNITY_LABEL
+    ):
+        print(
+            "[Community naming] Rejected gray label; dominant political metadata is "
+            f"{dominant_political_label}"
+        )
+        return None
+    return parsed
+
+
+def prefer_specific_political_label(label, members, meta_map):
+    """Prevent gray display labels when a specific political tag is available."""
+    canonical_label = coerce_allowed_label(label, default=DEFAULT_COMMUNITY_LABEL)
+    if canonical_label != DEFAULT_COMMUNITY_LABEL:
+        return canonical_label
+    metadata_label = fallback_label_from_metadata(members, meta_map)
+    if metadata_label != DEFAULT_COMMUNITY_LABEL:
+        return metadata_label
+    return canonical_label
+
+
+def aggregate_community_metadata(members, meta_map):
+    """Aggregate metadata for a community and return summary + counts."""
+    field_counts = {field: Counter() for field in META_FIELDS}
+    for member in members:
+        meta = meta_map.get(member, {})
+        for field in META_FIELDS:
+            value = meta.get(field)
+            if value:
+                field_counts[field][value] += 1
+
+    summary = {
+        field: (counter.most_common(1)[0][0] if counter else None)
+        for field, counter in field_counts.items()
+    }
+    return summary, field_counts
+
+
+def format_meta_summary(summary):
+    """Format metadata summary for tooltips/legend."""
+    parts = []
+    stance = summary.get("stance")
+    if isinstance(stance, dict):
+        target = stance.get("target")
+        stance_label = stance.get("stance")
+        if stance_label:
+            if target:
+                parts.append(f"موضع نسبت به {target}: {stance_label}")
+            else:
+                parts.append(f"موضع: {stance_label}")
+    for field, label in META_FIELDS.items():
+        value = summary.get(field)
+        if value:
+            parts.append(f"{label}: {value}")
+    echo = summary.get("echo")
+    if isinstance(echo, dict):
+        is_echo = echo.get("is_echo_chamber")
+        if is_echo is not None:
+            parts.append(f"اتاق پژواک: {'بله' if is_echo else 'خیر'}")
+        ei_index = echo.get("ei_index")
+        if isinstance(ei_index, (int, float)):
+            parts.append(f"E-I: {ei_index:.2f}")
+        conductance = echo.get("conductance")
+        if isinstance(conductance, (int, float)):
+            parts.append(f"هدایت: {conductance:.2f}")
+        homogeneity = echo.get("content_homogeneity")
+        if isinstance(homogeneity, (int, float)):
+            parts.append(f"همگنی: {homogeneity:.2f}")
+    return " | ".join(parts)
+
+
+def detect_target_from_label(label):
+    """Detect stance target based on label keywords."""
+    if not label:
+        return None
+    for target, keywords in STANCE_TARGETS.items():
+        if any(k in label for k in keywords):
+            return target
+    return None
+
+
+def compute_community_stance(label, members, stance_map, topic_label=None):
+    """Compute stance summary for a community."""
+    if not stance_map:
+        return None
+    target = detect_target_from_label(label)
+    target_key = target or "__topic__"
+    counts = Counter()
+    for member in members:
+        counts.update(stance_map.get(member, {}).get(target_key, Counter()))
+    total = sum(counts.values())
+    if total == 0:
+        return None
+    pos = counts.get("pos", 0)
+    neg = counts.get("neg", 0)
+    neu = counts.get("neu", 0)
+    if neu / total >= 0.7:
+        stance = "بی‌جهت‌گیری"
+    elif pos / total >= 0.6:
+        stance = "حامی"
+    elif neg / total >= 0.6:
+        stance = "منتقد"
     else:
-        raise ValueError(f"Unknown backend: {backend}")
+        stance = "ترکیبی"
+    return {
+        "target": target or topic_label,
+        "stance": stance,
+        "counts": {"pos": pos, "neg": neg, "neu": neu, "total": total}
+    }
 
 
-def call_local_llama(prompt: str, temperature: float = 0.5):
-    return call_llm(prompt, backend="local_llama", temperature=temperature, max_tokens=60)
+def compute_community_similarity(community_summaries):
+    """Compute pairwise similarity (Jaccard) from summary labels."""
+    comm_ids = list(community_summaries.keys())
+    signatures = {}
+    for comm_id in comm_ids:
+        signature = set()
+        for field in META_FIELDS:
+            value = community_summaries[comm_id].get(field)
+            if value:
+                signature.add((field, value))
+        signatures[comm_id] = signature
+
+    edges = []
+    for i in range(len(comm_ids)):
+        for j in range(i + 1, len(comm_ids)):
+            a = comm_ids[i]
+            b = comm_ids[j]
+            sig_a = signatures[a]
+            sig_b = signatures[b]
+            union = sig_a | sig_b
+            if not union:
+                continue
+            similarity = len(sig_a & sig_b) / len(union)
+            if similarity <= 0:
+                continue
+            edges.append({
+                "source": a,
+                "target": b,
+                "similarity": similarity,
+                "distance": 1 - similarity
+            })
+    return edges
 
 
-def call_org_llm(prompt: str, temperature: float = 0.75):
-    return call_llm(prompt, backend="org", temperature=temperature, max_tokens=80)
+def load_topic_label_from_elastic(file_path="elastic.py"):
+    """Extract topic query from elastic.py multi_match query."""
+    config = load_pipeline_config()
+    if config.get("topic_label"):
+        return config["topic_label"]
+    if not os.path.exists(file_path):
+        return None
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        match = re.search(
+            r'"multi_match"\s*:\s*\{[^}]*?"query"\s*:\s*"([^"]+)"',
+            content,
+            re.S
+        )
+        if not match:
+            match = re.search(
+                r"'multi_match'\s*:\s*\{[^}]*?'query'\s*:\s*'([^']+)'",
+                content,
+                re.S
+            )
+        if match:
+            return match.group(1).strip()
+    except Exception:
+        return None
+    return None
+
+
+def load_pipeline_config(file_path="pipeline_config.json"):
+    """Load topic/date/slot configuration written by elastic.py."""
+    if not os.path.exists(file_path):
+        return {}
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        print(f"[config] Failed to read {file_path}: {e}")
+        return {}
+
+
+def recent_date_range(days=DEFAULT_LOOKBACK_DAYS):
+    """Return an inclusive recent date range ending today."""
+    end = datetime.now().date()
+    start = end - timedelta(days=max(1, days) - 1)
+    return (
+        datetime.combine(start, datetime.min.time()),
+        datetime.combine(end, datetime.min.time()),
+    )
+
+
+def parse_config_date(value):
+    if not value:
+        return None
+    try:
+        return datetime.strptime(str(value)[:10], "%Y-%m-%d")
+    except Exception:
+        return None
+
+
+def get_pipeline_date_range(config):
+    """Get configured dates, falling back to the latest 14 inclusive days."""
+    start = parse_config_date(config.get("start_date"))
+    end = parse_config_date(config.get("end_date"))
+    if start and end:
+        return start, end
+    days = int(config.get("lookback_days") or DEFAULT_LOOKBACK_DAYS)
+    return recent_date_range(days)
+
+
+def inclusive_day_count(start_date, end_date):
+    return (end_date.date() - start_date.date()).days + 1
+
+
+def select_slot_modes_for_range(start_date, end_date):
+    """Pick timeline granularities from the full requested date range."""
+    days = inclusive_day_count(start_date, end_date)
+    if days <= 8:
+        return ["daily", "hourly"]
+    if days <= 45:
+        return ["weekly", "daily"]
+    if days <= 90:
+        return ["monthly", "weekly", "daily"]
+    if days <= 180:
+        return ["monthly", "weekly"]
+    return ["quarterly", "monthly", "weekly"]
+
+
+def apply_edge_widths(net, g, min_width=0.5, max_width=6.0):
+    """Scale edge widths by interaction weights."""
+    if not hasattr(net, "edges"):
+        return
+    weights = []
+    for edge in net.edges:
+        data = g.get_edge_data(edge.get("from"), edge.get("to"), default={})
+        weight = data.get("weight", 1)
+        edge["weight"] = weight
+        weights.append(weight)
+
+    if not weights:
+        return
+    min_weight = min(weights)
+    max_weight = max(weights)
+
+    for edge in net.edges:
+        weight = edge.get("weight", 1)
+        if max_weight == min_weight:
+            width = min_width
+        else:
+            width = min_width + (weight - min_weight) * (max_width - min_width) / (max_weight - min_weight)
+        edge["width"] = width
+        edge["title"] = f"وزن تعامل: {weight}"
+
+
+def serialize_hybrid_graph(g, partition=None):
+    """JSON nodes/edges for the API (vis-network compatible from/to)."""
+    partition = partition or {}
+    nodes = []
+    for node in sorted(g.nodes(), key=lambda value: str(value)):
+        comm_id = partition.get(node)
+        if comm_id is None:
+            community = None
+        elif isinstance(comm_id, (int, np.integer)):
+            community = int(comm_id)
+        else:
+            community = comm_id
+        comm_label = (
+            g.nodes[node].get("community_label_hybrid")
+            or g.nodes[node].get("community_label")
+        )
+        degree = int(g.degree(node))
+        nodes.append({
+            "id": str(node),
+            "label": str(node),
+            "community": community,
+            "community_label": comm_label,
+            "color": get_community_label_color(comm_label) if comm_label else None,
+            "degree": degree,
+            "size": 15 + min(degree * 2, 25),
+        })
+    edges = []
+    for u, v, data in g.edges(data=True):
+        left, right = sorted((str(u), str(v)))
+        weight = data.get("weight", 1)
+        try:
+            weight = int(weight)
+        except (TypeError, ValueError):
+            weight = 1
+        edges.append({
+            "id": f"{left}|{right}",
+            "from": left,
+            "to": right,
+            "weight": weight,
+        })
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "node_count": len(nodes),
+        "edge_count": len(edges),
+    }
+
+
+def save_hybrid_graph_json(g, partition, hybrid_html):
+    path = hybrid_html.replace(".html", ".json")
+    payload = serialize_hybrid_graph(g, partition)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(sanitize_json(payload), handle, ensure_ascii=False)
+    print(f"[saved] {path}")
+    return path
 
 
 # --- Helper: Extract recent texts from Elasticsearch or file ---
@@ -191,6 +817,8 @@ def get_recent_texts(center_node: str, max_samples: int = 3, max_chars: int = 30
 
 def is_valid_label(text):
     """Basic validation of generated community names."""
+    if coerce_allowed_label(text):
+        return True
     if not text or len(text.split()) > 4:  # Allow up to 4 words
         return False
 
@@ -207,6 +835,10 @@ def is_valid_label(text):
 
 def clean_label(text, default="ناشناس"):
     """Clean and normalize community labels."""
+    allowed = coerce_allowed_label(text)
+    if allowed:
+        return allowed
+
     if not text or len(text) < 3:
         return default
 
@@ -293,7 +925,7 @@ def clean_label(text, default="ناشناس"):
 
     # Final cleanup and validation
     text = text.strip()
-    return text if (text and has_persian(text)) else default
+    return coerce_allowed_label(text) or (text if (text and has_persian(text)) else default)
 
 
 def get_active_members(g, community_nodes, top_n=5):
@@ -375,7 +1007,7 @@ def save_communities(communities, filename=None):
         
         # Save with proper encoding and formatting
         with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            json.dump(sanitize_json(data), f, ensure_ascii=False, indent=2)
             
         print(f"Saved {len(communities_list)} communities to {filename}")
         return True
@@ -450,93 +1082,128 @@ def analyze_community_texts(texts, members):
     return matched_themes[0] if matched_themes else None
 
 
-def ai_name_community(center_node, neighbors, node_label_map, comm_id, method, time_period=None, g=None):
-    """
-    Naming pipeline using tweets and strict LLM priority:
-      1) Company LLM (creative)
-      2) Local LLM (conservative)
-      3) NODE_LABEL_MAP (dictionary)
-      4) Final fallback: 'ناشناس'
-
-    This function will also attach the final label to graph nodes under
-    g.nodes[node]['community_label'] when a graph object `g` is provided.
-    """
-    try:
-        # 1. Try dictionary quickly (but still attempt LLMs for creativity unless dict is explicit)
-        dict_label = node_label_map.get(center_node)
-
-        # 2. Fetch live texts for center + up to 3 top neighbors
-        sample_neighbors = neighbors[:3] if neighbors else []
-        nodes = [center_node] + sample_neighbors
-        texts_map = fetch_community_texts(nodes, max_texts=6)
-
-        # Build context from available normalized_texts
-        parts = []
-        for n in nodes:
-            tlist = texts_map.get(n, [])
-            if tlist:
-                parts.append(f"{n}: {' | '.join(tlist[:2])}")
-        context = "\n".join(parts)
-
-        # Load few-shot examples for style guidance
-        few_shot = load_few_shot_examples(2)
-
-        prompt = f"""
+def build_community_naming_prompt(context: str, few_shot: str) -> str:
+    """Build the canonical prompt used by naming backends."""
+    examples_block = few_shot.strip() if few_shot else "(no examples available)"
+    context_block = context.strip() if context.strip() else "(no context available)"
+    return f"""
 You are a professional analyst in social network analysis. Provide a single, concise Persian community name (max 3-4 words) that reflects the community's dominant theme or role. Avoid usernames and any extraneous punctuation. Return only the label text.
 
 Examples:
-{few_shot}
+{examples_block}
 
 Context (sample tweets):
-{context}
+{context_block}
 
 Answer (label only):
 """
 
-        candidate = None
 
-        # 3. Try company LLM (higher creativity)
-        try:
-            candidate = call_org_llm(prompt, temperature=0.75)
-        except Exception:
-            candidate = None
+def ai_name_community(center_node, neighbors, node_label_map, comm_id, method, time_period=None, g=None):
+    """
+    Classify a community into one of COMMUNITY_LABELS.
 
-        # 4. If org LLM fails or returns invalid output, try local LLM (more conservative)
-        if not candidate or not is_valid_label(clean_label(candidate, default=None)):
+    The graph stores labels per method because Louvain and Hybrid partitions can
+    assign the same node to different communities.
+    """
+    try:
+        members = [center_node] + list(neighbors)
+        meta_map = g.graph.get("meta_map", {}) if g is not None else {}
+        fallback_label = (
+            fallback_label_from_metadata(members, meta_map) or
+            DEFAULT_COMMUNITY_LABEL
+        )
+        cached = get_stored_community_profile(g, method, comm_id)
+        if isinstance(cached, dict) and cached.get("label"):
+            cached_label = prefer_specific_political_label(
+                cached["label"],
+                members,
+                meta_map,
+            )
+            if cached_label == cached["label"]:
+                return cached_label
+
+        summary, _ = aggregate_community_metadata(members, meta_map)
+
+        sample_neighbors = neighbors[:3] if neighbors else []
+        nodes = [center_node] + sample_neighbors
+        parts = []
+        if ENABLE_NAMING_TEXT_FETCH:
+            texts_map = {}
             try:
-                candidate_local = call_local_llama(prompt, temperature=0.5)
-                if candidate_local and is_valid_label(clean_label(candidate_local, default=None)):
-                    candidate = candidate_local
-            except Exception:
-                pass
+                texts_map = fetch_community_texts(nodes, max_texts=6)
+            except Exception as e:
+                print(f"[warning] text fetch failed for community {comm_id}: {e}")
 
-        # 5. If still no candidate, fall back to dictionary label
-        if not candidate:
-            candidate = dict_label
+            for n in nodes:
+                tlist = texts_map.get(n, [])
+                if tlist:
+                    parts.append(f"{n}: {' | '.join(tlist[:2])}")
 
-        # 6. Clean and final validation
-        final_label = clean_label(candidate, default="ناشناس")
-        if not is_valid_label(final_label):
-            final_label = "ناشناس"
+        meta_summary = format_meta_summary(summary)
+        if meta_summary:
+            parts.append(f"Metadata: {meta_summary}")
 
-        # 7. Persist and annotate graph nodes if provided
+        context = "\n".join(parts).strip()
+        if not context:
+            context = f"Dominant metadata label: {fallback_label}"
+
+        parsed = {
+            "selected_label": fallback_label,
+            "confidence": 0,
+            "reasoning": "metadata fallback"
+        }
+        if ENABLE_LLM_NAMING:
+            prompt = build_community_classification_prompt(
+                members=members,
+                text_content=context,
+                dominant_political_label=fallback_label,
+            )
+            parsed, _ = call_llm_with_fallback(
+                prompt,
+                validator=lambda candidate: validate_llm_community_label(
+                    candidate,
+                    fallback_label,
+                ),
+                org_temperature=0.2,
+                local_temperature=0.1,
+                max_tokens=180,
+            )
+
+            if not parsed:
+                parsed = {
+                    "selected_label": fallback_label,
+                    "confidence": 0,
+                    "reasoning": "dominant political metadata fallback"
+                }
+
+        if (
+            parsed["selected_label"] == DEFAULT_COMMUNITY_LABEL
+            and fallback_label != DEFAULT_COMMUNITY_LABEL
+        ):
+            parsed = {
+                "selected_label": fallback_label,
+                "confidence": 0,
+                "reasoning": "gray label overridden by dominant political metadata",
+            }
+
+        profile = build_community_profile(members, context, parsed)
+        final_label = profile.name
+
+        save_community_profile_to_graph(g, method, comm_id, members, profile)
         try:
             save_community_name(final_label, center_node, neighbors, comm_id, method, time_period)
         except Exception:
             pass
 
-        if g is not None:
-            # Attach label to all nodes in community (center + neighbors)
-            for n in [center_node] + list(neighbors):
-                if n in g.nodes:
-                    g.nodes[n]["community_label"] = final_label
-
-        # 8. Append to communities summary
         if not hasattr(ai_name_community, "communities"):
             ai_name_community.communities = []
         ai_name_community.communities.append({
             "id": comm_id,
             "name": final_label,
+            "confidence": profile.confidence,
+            "reasoning": profile.reasoning,
+            "description": profile.description,
             "center_node": center_node,
             "members": neighbors,
             "method": method,
@@ -547,7 +1214,7 @@ Answer (label only):
 
     except Exception as e:
         print(f"[error] naming community {comm_id}: {e}")
-        return "ناشناس"
+        return DEFAULT_COMMUNITY_LABEL
 
 
 # Map of key accounts to their community identities
@@ -671,16 +1338,18 @@ def visualize_graph_interactively(
     
     # Add the graph after options are set
     net.from_nx(g)
+    apply_edge_widths(net, g)
 
     # Optional: color nodes by community/cluster
     if partition:
         centers = get_community_centers(g, partition)
         for node, community_id in partition.items():
-            # visually distinct hues
-            color = f"hsl({(community_id * 47) % 360}, 70%, 60%)"
-            net.get_node(node)['color'] = color
             center_node = centers.get(community_id)
-            label = NODE_LABEL_MAP.get(center_node, f"گروه {community_id}")
+            label = coerce_allowed_label(
+                NODE_LABEL_MAP.get(center_node),
+                default=DEFAULT_COMMUNITY_LABEL,
+            )
+            net.get_node(node)['color'] = get_community_label_color(label)
             net.get_node(node)['title'] = f"""
 <div style="max-width: 300px; padding: 8px; text-align: right;">
     <strong style="font-size: 14px; display: block; margin-bottom: 4px;">{node}</strong>
@@ -707,7 +1376,7 @@ def visualize_graph_interactively(
                 title = net.get_node(node).get("title", node)
                 net.get_node(node)['title'] = f"{title} ({label})"
 
-    net.show(filename)
+    save_network_html(net, filename)
     print(f"Interactive graph saved to {filename}")
 
 
@@ -743,13 +1412,17 @@ def visualize_embeddings(embeddings, labels, nodes, ax):
 
 
 # CLASSIC Approach: Louvain Detector
-def detect_communities_louvain(g):
+def detect_communities_louvain(g, random_seed=COMMUNITY_RANDOM_SEED):
     """
     Run Louvain algorithm on graph G and return partition.
     G: networkx.Graph
     Returns: dict mapping node → community_id
     """
-    partition = community_louvain.best_partition(g, weight='weight')
+    partition = community_louvain.best_partition(
+        g,
+        weight='weight',
+        random_state=random_seed,
+    )
     return partition
 
 
@@ -769,9 +1442,7 @@ def main_louvain(g):
     for node, comm in partition.items():
         print(f"Node {node}: Community {comm}")
 
-    # Add interactive visualization
-    visualize_graph_interactively(g, partition, title="Louvain Graph",
-                                  filename="louvain_graph.html")
+    return partition
 
 
 # HYBRID Approach: Node2Vec + Clustering
@@ -792,24 +1463,25 @@ def build_user_graph(messages):
         edge_weights[(sender, target)] += 1
 
     # Filter and add strong edges
-    for (sender, target), total_weight in edge_weights.items():
+    for (sender, target), total_weight in sorted(edge_weights.items()):
         if total_weight >= 1:
             g.add_edge(sender, target, weight=total_weight)
     print(f"Graph has {g.number_of_nodes()} nodes and {g.number_of_edges()} edges.")
     return g
 
 
-def get_node_embeddings(g, dimensions=64):
+def get_node_embeddings(g, dimensions=64, random_seed=COMMUNITY_RANDOM_SEED):
     """
     Generate Node2Vec embeddings for the graph.
     """
+    workers = int(os.getenv("NODE2VEC_WORKERS", "1"))
     node2vec = Node2Vec(g, dimensions=dimensions, walk_length=20, num_walks=100,
-                        workers=2)
-    model = node2vec.fit(window=10, min_count=1)
+                        workers=workers, seed=random_seed)
+    model = node2vec.fit(window=10, min_count=1, seed=random_seed)
 
     # Ensure embeddings are generated for all nodes
     embeddings = []
-    nodes = list(g.nodes())
+    nodes = sorted(g.nodes())
     for node in nodes:
         try:
             embeddings.append(model.wv[str(node)])
@@ -848,8 +1520,38 @@ def load_interactions(file_path="interactions.json"):
     return messages
 
 
+def get_interactions_date_range(file_path="interactions.json"):
+    """Return min/max datetime from interactions.json date fields."""
+    min_dt = None
+    max_dt = None
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                date_val = msg.get("date")
+                if not date_val:
+                    continue
+                date_str = str(date_val)[:10]
+                if len(date_str) != 10:
+                    continue
+                try:
+                    dt = datetime.strptime(date_str, "%Y-%m-%d")
+                except Exception:
+                    continue
+                if min_dt is None or dt < min_dt:
+                    min_dt = dt
+                if max_dt is None or dt > max_dt:
+                    max_dt = dt
+    except FileNotFoundError:
+        return None, None
+    return min_dt, max_dt
+
+
 # Glue It All Together
-def run_kmeans(embeddings, n_clusters=5):
+def run_kmeans(embeddings, n_clusters=5, random_seed=COMMUNITY_RANDOM_SEED):
     from sklearn.cluster import KMeans
     n_samples = embeddings.shape[0]
     if n_samples < n_clusters:
@@ -859,8 +1561,196 @@ def run_kmeans(embeddings, n_clusters=5):
             f" due to small sample size ({n_samples})."
         )
         print(msg)
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    kmeans = KMeans(
+        n_clusters=n_clusters,
+        random_state=random_seed,
+        n_init=10,
+    )
     return kmeans.fit_predict(embeddings)
+
+
+def summarize_partition_sizes(partition):
+    """Summarize community sizes for a partition dict."""
+    if not partition:
+        return {"num_clusters": 0, "total_nodes": 0, "sizes": []}
+    counts = Counter(partition.values())
+    sizes = sorted(counts.values(), reverse=True)
+    arr = np.array(sizes, dtype=float)
+    return {
+        "num_clusters": len(sizes),
+        "total_nodes": int(arr.sum()),
+        "min_size": int(arr.min()),
+        "max_size": int(arr.max()),
+        "mean_size": float(arr.mean()),
+        "median_size": float(np.median(arr)),
+        "sizes": sizes
+    }
+
+
+def compute_modularity_safe(g, partition):
+    """Compute modularity with guardrails."""
+    if not partition or g.number_of_edges() == 0:
+        return None
+    try:
+        return float(community_louvain.modularity(partition, g, weight="weight"))
+    except Exception:
+        return None
+
+
+def compute_echo_metrics(g, partition, stance_map=None, topic_label=None, thresholds=None):
+    """Compute echo chamber metrics for a partition."""
+    communities = defaultdict(list)
+    for node, cid in partition.items():
+        communities[cid].append(node)
+
+    echo_metrics = {}
+    for cid, members in communities.items():
+        stance_info = None
+        if stance_map:
+            stance_info = compute_community_stance(None, members, stance_map, topic_label=topic_label)
+        homogeneity = compute_content_homogeneity(stance_info)
+        ei_index = compute_ei_index(g, members)
+        conductance = compute_conductance(g, members)
+        echo_metrics[cid] = {
+            "ei_index": ei_index,
+            "conductance": conductance,
+            "content_homogeneity": homogeneity,
+            "size": len(members),
+            "is_echo_chamber": classify_echo_chamber(
+                ei_index, conductance, homogeneity, len(members), thresholds=thresholds
+            ),
+        }
+        if stance_info:
+            echo_metrics[cid]["stance"] = stance_info
+
+    return echo_metrics
+
+
+def summarize_echo_metrics(echo_metrics, thresholds=None):
+    """Print summary stats for echo metrics vs thresholds."""
+    th = dict(DEFAULT_ECHO_THRESHOLDS)
+    if thresholds:
+        th.update(thresholds)
+    total = len(echo_metrics)
+    if total == 0:
+        print("[echo] No communities to summarize.")
+        return
+    counts = {
+        "size_ok": 0,
+        "ei_ok": 0,
+        "conductance_ok": 0,
+        "homogeneity_ok": 0,
+        "all_ok": 0,
+        "homogeneity_missing": 0,
+    }
+    for info in echo_metrics.values():
+        size = info.get("size", 0)
+        ei = info.get("ei_index")
+        conductance = info.get("conductance")
+        homogeneity = info.get("content_homogeneity")
+        size_ok = size >= th["min_size"]
+        ei_ok = ei is not None and ei <= th["ei_index_max"]
+        conductance_ok = conductance is not None and conductance <= th["conductance_max"]
+        if homogeneity is None:
+            counts["homogeneity_missing"] += 1
+        homogeneity_ok = homogeneity is not None and homogeneity >= th["homogeneity_min"]
+        if size_ok:
+            counts["size_ok"] += 1
+        if ei_ok:
+            counts["ei_ok"] += 1
+        if conductance_ok:
+            counts["conductance_ok"] += 1
+        if homogeneity_ok:
+            counts["homogeneity_ok"] += 1
+        if size_ok and ei_ok and conductance_ok and homogeneity_ok:
+            counts["all_ok"] += 1
+    print(
+        "[echo] Summary:",
+        f"total={total},",
+        f"size_ok={counts['size_ok']},",
+        f"ei_ok={counts['ei_ok']},",
+        f"conductance_ok={counts['conductance_ok']},",
+        f"homogeneity_ok={counts['homogeneity_ok']},",
+        f"homogeneity_missing={counts['homogeneity_missing']},",
+        f"echo_true={counts['all_ok']}"
+    )
+
+
+def build_hybrid_report(g, embeddings, nodes, hybrid_labels, louvain_partition=None,
+                        start_date=None, end_date=None, stance_map=None,
+                        topic_label=None, thresholds=None):
+    """Build a comparable report for hybrid vs Louvain partitions."""
+    hybrid_partition = {node: int(hybrid_labels[i]) for i, node in enumerate(nodes)}
+    report = {
+        "timeframe": {"start": start_date, "end": end_date},
+        "hybrid": {
+            "size_summary": summarize_partition_sizes(hybrid_partition),
+            "modularity": compute_modularity_safe(g, hybrid_partition)
+        }
+    }
+
+    report["hybrid"]["echo_metrics"] = compute_echo_metrics(
+        g,
+        hybrid_partition,
+        stance_map=stance_map,
+        topic_label=topic_label,
+        thresholds=thresholds,
+    )
+    report["hybrid"]["echo_thresholds"] = dict(DEFAULT_ECHO_THRESHOLDS, **(thresholds or {}))
+
+    # Silhouette score (embedding quality proxy)
+    unique_labels = set(hybrid_labels)
+    if len(unique_labels) > 1 and len(embeddings) > 1:
+        try:
+            report["hybrid"]["silhouette"] = float(silhouette_score(embeddings, hybrid_labels))
+        except Exception:
+            report["hybrid"]["silhouette"] = None
+    else:
+        report["hybrid"]["silhouette"] = None
+
+    if louvain_partition:
+        report["louvain"] = {
+            "size_summary": summarize_partition_sizes(louvain_partition),
+            "modularity": compute_modularity_safe(g, louvain_partition)
+        }
+        report["louvain"]["echo_metrics"] = compute_echo_metrics(
+            g,
+            louvain_partition,
+            stance_map=stance_map,
+            topic_label=topic_label,
+            thresholds=thresholds,
+        )
+        report["louvain"]["echo_thresholds"] = dict(DEFAULT_ECHO_THRESHOLDS, **(thresholds or {}))
+        # Compare partitions on shared nodes
+        louvain_labels = [louvain_partition.get(node) for node in nodes]
+        if all(label is not None for label in louvain_labels):
+            try:
+                report["comparison"] = {
+                    "nmi": float(normalized_mutual_info_score(louvain_labels, hybrid_labels)),
+                    "ari": float(adjusted_rand_score(louvain_labels, hybrid_labels))
+                }
+            except Exception:
+                report["comparison"] = {"nmi": None, "ari": None}
+            # Temporal stability proxy (same window, different methods)
+            report["comparison"]["stability"] = {
+                "AMI": report["comparison"]["ari"],
+                "NMI": report["comparison"]["nmi"]
+            }
+
+    return report
+
+
+def save_hybrid_report(report, output_dir="communities"):
+    """Persist hybrid report to JSON."""
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    start = report.get("timeframe", {}).get("start", "unknown")
+    end = report.get("timeframe", {}).get("end", "unknown")
+    filename = f"{output_dir}/hybrid_report_{start}_to_{end}_{timestamp}.json"
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(sanitize_json(report), f, ensure_ascii=False, indent=2)
+    print(f"[saved] {filename}")
+    return filename
 
 
 def main_hybrid(g, ax):
@@ -909,47 +1799,88 @@ def clean_graph(g):
 
 
 # ---- Helper: Style Partition ----
-def style_partition(g, net, partition, method, base_hue):
+def style_partition(g, net, partition, method, _base_hue):
     """Style nodes using stored labels and return legend data with matching colors."""
     if g.number_of_nodes() == 0 or not partition:
         return {}
 
+    method_key = normalize_method_key(method)
+    meta_map = g.graph.get("meta_map", {})
+    stance_map = g.graph.get("stance_map", {})
+    topic_label = g.graph.get("topic_label")
+    echo_by_comm = compute_echo_metrics(
+        g,
+        partition,
+        stance_map=stance_map,
+        topic_label=topic_label,
+    )
     centers = get_community_centers(g, partition)
     communities = []
     for comm_id, center in centers.items():
         members = [n for n, c in partition.items() if c == comm_id]
         if not members:
             continue
-        label = g.nodes[center].get("community_label")
+        label = get_stored_community_label(g, method_key, comm_id, center)
         if not label:
             neighbors = [n for n in members if n != center]
-            label = ai_name_community(center, neighbors, NODE_LABEL_MAP, comm_id, method, g=g)
+            label = ai_name_community(center, neighbors, NODE_LABEL_MAP, comm_id, method_key, g=g)
         if not label:
-            label = NODE_LABEL_MAP.get(center, f"گروه {comm_id}")
+            label = fallback_label_from_metadata(members, meta_map)
+        label = prefer_specific_political_label(label, members, meta_map)
+        stance_info = compute_community_stance(label, members, stance_map, topic_label=topic_label)
+        if stance_info:
+            if "حامیان" in label and stance_info["stance"] == "منتقد":
+                label = label.replace("حامیان", "منتقدان")
+            elif "حامیان" in label and stance_info["stance"] == "ترکیبی":
+                label = label.replace("حامیان", "بحث درباره")
         for node in members:
-            g.nodes[node]["community_label"] = label
+            g.nodes[node][f"community_label_{method_key}"] = label
+        summary, _ = aggregate_community_metadata(members, meta_map)
+        if stance_info:
+            summary["stance"] = stance_info
+        echo_info = echo_by_comm.get(comm_id)
+        if isinstance(echo_info, dict):
+            summary["echo"] = {
+                "is_echo_chamber": echo_info.get("is_echo_chamber"),
+                "ei_index": echo_info.get("ei_index"),
+                "conductance": echo_info.get("conductance"),
+                "content_homogeneity": echo_info.get("content_homogeneity"),
+            }
         communities.append({
             "id": comm_id,
             "label": label,
             "center": center,
-            "members": members
+            "members": members,
+            "summary": summary
         })
 
     if not communities:
         return {}
 
-    golden_ratio = 0.618033988749895
-    legend_map: Dict[str, Dict[str, Any]] = {}
-
     sorted_communities = sorted(communities, key=lambda c: len(c["members"]), reverse=True)
-    for idx, community in enumerate(sorted_communities):
-        hue = (base_hue + idx * 360 * golden_ratio) % 360
-        saturation = min(70 + len(community["members"]) * 1.5, 90)
-        lightness = 58
-        color = f"hsl({hue},{saturation}%,{lightness}%)"
 
+    label_sizes = Counter()
+    label_meta = {}
+    for community in sorted_communities:
+        label_sizes[community["label"]] += len(community["members"])
+        label_meta.setdefault(community["label"], community.get("summary", {}))
+
+    label_colors: Dict[str, str] = {}
+    for label in label_sizes:
+        label_colors[label] = get_community_label_color(label)
+
+    legend_map: Dict[str, Dict[str, Any]] = {
+        label: {
+            "color": color,
+            "count": label_sizes[label],
+            "meta": label_meta.get(label, {})
+        }
+        for label, color in label_colors.items()
+    }
+
+    for community in sorted_communities:
         display_label = community["label"]
-
+        color = label_colors[display_label]
         for node in community["members"]:
             node_data = net.get_node(node)
             if not node_data:
@@ -957,24 +1888,97 @@ def style_partition(g, net, partition, method, base_hue):
             degree_boost = min(g.degree(node) * 2, 25)
             role_boost = 15 if node == community["center"] else 0
             size = 15 + degree_boost + role_boost
+            meta_summary = format_meta_summary(community.get("summary", {}))
+            title = f"{node}<br>جامعه: {display_label}"
+            if meta_summary:
+                title = f"{title}<br>{meta_summary}"
             node_data.update({
                 "color": color,
                 "label": node,
-                "title": f"{node}\nجامعه: {display_label}",
+                "title": title,
                 "size": size,
                 "shape": "dot",
+                "community_label": display_label,
                 "borderWidth": 2 if node == community["center"] else 1,
                 "borderWidthSelected": 3,
                 "font": {"size": 14, "face": "Vazirmatn"},
                 "physics": True,
             })
 
-        legend_map[display_label] = {
-            "color": color,
-            "count": len(community["members"])
-        }
-
+    apply_edge_widths(net, g)
     return legend_map
+
+
+def save_community_similarity_graph(g, partition, method, base_filename):
+    """Generate a community-level similarity graph from metadata summaries."""
+    meta_map = g.graph.get("meta_map", {})
+    if not meta_map or not partition:
+        return None
+
+    communities = defaultdict(list)
+    for node, comm_id in partition.items():
+        communities[comm_id].append(node)
+
+    summaries = {}
+    labels = {}
+    for comm_id, members in communities.items():
+        summary, _ = aggregate_community_metadata(members, meta_map)
+        summaries[comm_id] = summary
+        label = get_stored_community_label(g, method, comm_id)
+        labels[comm_id] = prefer_specific_political_label(label, members, meta_map)
+
+    edges = compute_community_similarity(summaries)
+    if not edges:
+        return None
+
+    output_html = base_filename.replace("dashboard_", f"{method}_similarity_")
+    output_json = output_html.replace(".html", ".json")
+
+    net = Network(
+        height="600px",
+        width="100%",
+        notebook=False,
+        bgcolor="#ffffff",
+        font_color="#333333"
+    )
+    net.options = {
+        "physics": {
+            "enabled": True,
+            "stabilization": {"enabled": True, "iterations": 100}
+        },
+        "edges": {"color": "#7f8c8d"},
+        "interaction": {"hover": True}
+    }
+
+    for comm_id, members in communities.items():
+        label = labels.get(comm_id, f"گروه {comm_id}")
+        summary_text = format_meta_summary(summaries.get(comm_id, {}))
+        title = f"{label}<br>اندازه: {len(members)}"
+        if summary_text:
+            title = f"{title}<br>{summary_text}"
+        net.add_node(
+            str(comm_id),
+            label=label,
+            title=title,
+            color=get_community_label_color(label),
+            size=15 + min(len(members), 30)
+        )
+
+    for edge in edges:
+        width = 1 + edge["similarity"] * 6
+        title = f"شباهت: {edge['similarity']:.2f} | فاصله: {edge['distance']:.2f}"
+        net.add_edge(
+            str(edge["source"]),
+            str(edge["target"]),
+            width=width,
+            title=title
+        )
+
+    save_network_html(net, output_html)
+    with open(output_json, "w", encoding="utf-8") as f:
+        json.dump(sanitize_json(edges), f, ensure_ascii=False, indent=2)
+    print(f"[saved] {output_html}, {output_json}")
+    return output_html
 
 
 # ---- Helper: Visualize or Dummy ----
@@ -1013,6 +2017,17 @@ def numpy_to_python(obj):
     return obj
 
 
+def sanitize_json(obj):
+    """Recursively convert numpy/scalar types for JSON serialization."""
+    if isinstance(obj, dict):
+        return {str(k): sanitize_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [sanitize_json(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [sanitize_json(v) for v in obj]
+    return numpy_to_python(obj)
+
+
 def write_summary_file(communities, start_date, end_date):
     """Write a human-readable summary of communities."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
@@ -1045,14 +2060,204 @@ def write_summary_file(communities, start_date, end_date):
         print(f"[error] writing summary: {e}")
 
 
-def visualize_or_dummy(slot_start, slot_end, g, louvain=None, hybrid=None):
+def format_slot_value(dt, slot_mode=None):
+    if slot_mode == "hourly":
+        return dt.strftime("%Y-%m-%d %H:%M")
+    return dt.strftime("%Y-%m-%d")
+
+
+def format_slot_filename_part(dt, slot_mode=None):
+    if slot_mode == "hourly":
+        return dt.strftime("%y%m%d%H")
+    return dt.strftime("%y%m%d")
+
+
+def parse_message_datetime(value):
+    if not value:
+        return None
+    raw = str(value).strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(raw).replace(tzinfo=None)
+    except Exception:
+        try:
+            return datetime.strptime(raw[:10], "%Y-%m-%d")
+        except Exception:
+            return None
+
+
+def get_account_party(account, meta_map):
+    if not account:
+        return None
+    meta = meta_map.get(account, {}) if meta_map else {}
+    return coerce_allowed_label(meta.get("political_label"), default=None)
+
+
+def infer_interaction_topic(msg, counterpart):
+    for field in ("topic", "category", "hashtag", "event", "organization", "person", "location"):
+        value = msg.get(field)
+        if isinstance(value, list) and value:
+            return str(value[0])
+        if value:
+            return str(value)
+    interaction_labels = {
+        "mention": "ذکر",
+        "quote": "نقل‌قول",
+        "repost": "بازنشر",
+        "reply": "پاسخ",
+    }
+    interaction_type = interaction_labels.get(str(msg.get("type") or "").lower(), "تعامل")
+    if counterpart:
+        return f"{interaction_type} @{counterpart}"
+    return interaction_type
+
+
+def build_party_focus_for_messages(messages, meta_map, top_n=6):
+    """Summarize selected political groups across interaction axes for one slot."""
+    parties = defaultdict(lambda: {
+        "total": 0,
+        "incoming": 0,
+        "outgoing": 0,
+        "topics": Counter(),
+    })
+
+    for msg in messages:
+        sender = msg.get("sender")
+        target = msg.get("target")
+        sender_party = get_account_party(sender, meta_map)
+        target_party = get_account_party(target, meta_map)
+
+        if sender_party:
+            topic = infer_interaction_topic(msg, target)
+            parties[sender_party]["total"] += 1
+            parties[sender_party]["outgoing"] += 1
+            parties[sender_party]["topics"][topic] += 1
+
+        if target_party and target_party != sender_party:
+            topic = infer_interaction_topic(msg, sender)
+            parties[target_party]["total"] += 1
+            parties[target_party]["incoming"] += 1
+            parties[target_party]["topics"][topic] += 1
+
+    return {
+        party: {
+            "total": data["total"],
+            "incoming": data["incoming"],
+            "outgoing": data["outgoing"],
+            "topics": [
+                {"label": label, "count": count}
+                for label, count in data["topics"].most_common(top_n)
+            ],
+        }
+        for party, data in sorted(
+            parties.items(),
+            key=lambda item: item[1]["total"],
+            reverse=True,
+        )
+        if data["total"] > 0
+    }
+
+
+def collect_node_party_changes(
+        g, previous_parties, current_slot, slot_mode, topic_label):
+    """Build party-transition events and update in-memory node state.
+
+    State intentionally lives only for the duration of the process. Persistence
+    is delegated to the backend API; this function never writes an output file.
+    """
+    events = []
+    for node in sorted(g.nodes()):
+        party = get_stored_community_label(g, "hybrid", None, node=node)
+        if not party:
+            continue
+
+        previous = previous_parties.get(node)
+        if previous and previous["party"] != party:
+            identity = {
+                "node_id": str(node),
+                "from_party": previous["party"],
+                "to_party": party,
+                "previous_slot": previous["slot"],
+                "current_slot": current_slot,
+                "slot_mode": slot_mode,
+                "topic": topic_label,
+            }
+            event_id = hashlib.sha256(
+                json.dumps(
+                    identity,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            events.append({
+                "event_id": event_id,
+                **identity,
+                "detected_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            })
+
+        previous_parties[node] = {
+            "party": party,
+            "slot": current_slot,
+        }
+    return events
+
+
+def post_party_change_events(events):
+    """POST party changes to the configured backend without local fallback."""
+    if not events:
+        return True
+
+    api_url = (os.getenv("PARTY_CHANGE_API_URL") or "").strip()
+    if not api_url:
+        print(
+            f"[party-change] Detected {len(events)} transition(s); "
+            "API is not configured, so they were not persisted."
+        )
+        return False
+
+    headers = {"Content-Type": "application/json"}
+    api_token = (os.getenv("PARTY_CHANGE_API_TOKEN") or "").strip()
+    if api_token:
+        headers["Authorization"] = f"Bearer {api_token}"
+
+    timeout = float(os.getenv("PARTY_CHANGE_API_TIMEOUT", "10"))
+    try:
+        response = requests.post(
+            api_url,
+            json={"events": events},
+            headers=headers,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        print(f"[party-change] Posted {len(events)} transition(s) to backend API.")
+        return True
+    except requests.RequestException as exc:
+        print(
+            f"[party-change] API request failed for {len(events)} "
+            f"transition(s): {exc}"
+        )
+        return False
+
+
+def visualize_or_dummy(slot_start, slot_end, g, louvain=None, hybrid=None, slot_mode=None):
     """Visualize or use an empty graph if g is empty."""
     # Format filename for the time slot
-    date_format = "%y%m%d"
-    start_str = slot_start.strftime(date_format)
-    end_str = slot_end.strftime(date_format)
-    filename = f"dashboard_{start_str}_to_{end_str}.html"
+    start_str = format_slot_filename_part(slot_start, slot_mode)
+    end_str = format_slot_filename_part(slot_end, slot_mode)
+    mode_part = f"{slot_mode}_" if slot_mode else ""
+    filename = f"dashboard_{mode_part}{start_str}_to_{end_str}.html"
     legend_path = filename.replace(".html", "_legend.json")
+
+    # Drop the previous run's graph JSON so a failed slot never serves it.
+    stale_graph_json = filename.replace("dashboard_", "hybrid_graph_").replace(
+        ".html", ".json"
+    )
+    try:
+        os.remove(stale_graph_json)
+    except OSError:
+        pass
     
     # Initialize empty partitions if needed
     if g.number_of_nodes() == 0:
@@ -1063,30 +2268,17 @@ def visualize_or_dummy(slot_start, slot_end, g, louvain=None, hybrid=None):
         partition_louvain = louvain if louvain else {}
         partition_hybrid = hybrid if hybrid else {}
 
+    legend_data = {
+        "hybrid": {"groups": {}},
+    }
+
     try:
         # Reset community store before detection
-        if not hasattr(ai_name_community, "communities"):
-            ai_name_community.communities = []
+        ai_name_community.communities = []
 
         # IMPORTANT: Call ai_name_community for each community
-        time_period = f"{slot_start.strftime('%Y-%m-%d')} تا {slot_end.strftime('%Y-%m-%d')}"
+        time_period = f"{format_slot_value(slot_start, slot_mode)} تا {format_slot_value(slot_end, slot_mode)}"
         
-        # Get community centers for Louvain
-        if partition_louvain:
-            print(f"\n[louvain] Detecting {len(set(partition_louvain.values()))} communities...")
-            louvain_centers = get_community_centers(g, partition_louvain)
-            
-            for comm_id, center_node in louvain_centers.items():
-                # Get all members of this community
-                neighbors = [
-                    n for n, c in partition_louvain.items() 
-                    if c == comm_id and n != center_node
-                ]
-                
-                # Call naming function
-                print(f"[louvain] Naming community {comm_id}: center={center_node}, members={len(neighbors)}")
-                ai_name_community(center_node, neighbors, NODE_LABEL_MAP, comm_id, "louvain", time_period)
-
         # Get community centers for Hybrid
         if partition_hybrid:
             print(f"\n[hybrid] Detecting {len(set(partition_hybrid.values()))} communities...")
@@ -1101,14 +2293,17 @@ def visualize_or_dummy(slot_start, slot_end, g, louvain=None, hybrid=None):
                 
                 # Call naming function
                 print(f"[hybrid] Naming community {comm_id}: center={center_node}, members={len(neighbors)}")
-                ai_name_community(center_node, neighbors, NODE_LABEL_MAP, comm_id, "hybrid", time_period)
+                ai_name_community(
+                    center_node, neighbors, NODE_LABEL_MAP,
+                    comm_id, "hybrid", time_period, g=g
+                )
 
         # Save community details
         if hasattr(ai_name_community, "communities"):
             write_summary_file(
                 ai_name_community.communities,
-                slot_start.strftime("%Y-%m-%d"),
-                slot_end.strftime("%Y-%m-%d")
+                format_slot_value(slot_start, slot_mode).replace(":", ""),
+                format_slot_value(slot_end, slot_mode).replace(":", "")
             )
             
             os.makedirs("communities", exist_ok=True)
@@ -1117,8 +2312,8 @@ def visualize_or_dummy(slot_start, slot_end, g, louvain=None, hybrid=None):
             
             communities_data = {
                 "timeframe": {
-                    "start": slot_start.strftime("%Y-%m-%d"),
-                    "end": slot_end.strftime("%Y-%m-%d")
+                    "start": format_slot_value(slot_start, slot_mode),
+                    "end": format_slot_value(slot_end, slot_mode)
                 },
                 "communities": [
                     {k: numpy_to_python(v) for k, v in comm.items()}
@@ -1127,15 +2322,11 @@ def visualize_or_dummy(slot_start, slot_end, g, louvain=None, hybrid=None):
             }
             
             with open(output_path, "w", encoding="utf-8") as f:
-                json.dump(communities_data, f, ensure_ascii=False, indent=2)
+                json.dump(sanitize_json(communities_data), f, ensure_ascii=False, indent=2)
             print(f"[saved] {output_path}")
 
         # Create base legend data
         legend_data = {
-            "louvain": {
-                "groups": {str(k): numpy_to_python(v) 
-                          for k, v in partition_louvain.items()}
-            },
             "hybrid": {
                 "groups": {str(k): numpy_to_python(v) 
                           for k, v in partition_hybrid.items()}
@@ -1143,12 +2334,13 @@ def visualize_or_dummy(slot_start, slot_end, g, louvain=None, hybrid=None):
         }
 
         with open(legend_path, 'w', encoding='utf-8') as f:
-            json.dump(legend_data, f, ensure_ascii=False, indent=2)
+            json.dump(sanitize_json(legend_data), f, ensure_ascii=False, indent=2)
         
         # Visualize the graph
         visualize_combined_dashboard(
             g, partition_louvain, partition_hybrid, filename
         )
+        return filename
         
     except Exception as e:
         print(f"[error] Visualization failed for {start_str} to {end_str}: {e}")
@@ -1158,14 +2350,15 @@ def visualize_or_dummy(slot_start, slot_end, g, louvain=None, hybrid=None):
         with open(filename, 'w', encoding='utf-8') as f:
             f.write("<html><body>Error generating visualization</body></html>")
         with open(legend_path, 'w', encoding='utf-8') as f:
-            json.dump(legend_data, f)
+            json.dump(sanitize_json(legend_data), f)
+        return filename
 
 
 # ---- Combined Dashboard Visualization ----
 def create_community_network():
     """Create a network with optimal visualization settings."""
     net = Network(
-        height="600px",
+        height="100vh",
         width="100%",
         notebook=False,
         heading="",
@@ -1204,40 +2397,121 @@ def create_community_network():
     return net
 
 
+def save_network_html(net, filename):
+    """Write a PyVis network without trying to open a browser."""
+    net.write_html(filename)
+    try:
+        with open(filename, "r", encoding="utf-8") as f:
+            html = f.read()
+        if "codex-pyvis-fullscreen-css" not in html:
+            html = html.replace(
+                "<style type=\"text/css\">",
+                """<style type=\"text/css\">
+             /* codex-pyvis-fullscreen-css */
+             html, body {
+                 width: 100%;
+                 height: 100%;
+                 margin: 0;
+                 padding: 0;
+                 overflow: hidden;
+             }
+             body {
+                 position: fixed;
+                 inset: 0;
+             }
+             body > .card,
+             .card,
+             .card-body {
+                 width: 100% !important;
+                 height: 100% !important;
+                 margin: 0 !important;
+                 padding: 0 !important;
+                 border: 0 !important;
+                 border-radius: 0 !important;
+                 box-shadow: none !important;
+             }
+             #mynetwork {
+                 width: 100vw !important;
+                 height: 100vh !important;
+                 min-width: 100vw !important;
+                 min-height: 100vh !important;
+                 border: 0 !important;
+                 float: none !important;
+             }
+""",
+                1,
+            )
+        if "codex-pyvis-fit-to-frame" not in html:
+            html = html.replace(
+                "                  return network;",
+                """                  // codex-pyvis-fit-to-frame
+                  function codexFitNetwork() {
+                      if (!network || !container) return;
+                      network.setSize('100%', '100%');
+                      network.redraw();
+                      network.fit({
+                          animation: false,
+                          minZoomLevel: 0.08,
+                          maxZoomLevel: 3.5
+                      });
+                  }
+                  network.once("stabilizationIterationsDone", function() {
+                      setTimeout(codexFitNetwork, 60);
+                  });
+                  window.addEventListener("load", function() {
+                      setTimeout(codexFitNetwork, 120);
+                  });
+                  window.addEventListener("resize", function() {
+                      setTimeout(codexFitNetwork, 60);
+                  });
+                  if (window.ResizeObserver) {
+                      new ResizeObserver(function() {
+                          setTimeout(codexFitNetwork, 60);
+                      }).observe(container);
+                  }
+
+                  return network;""",
+                1,
+            )
+        if html != open(filename, "r", encoding="utf-8").read():
+            with open(filename, "w", encoding="utf-8") as f:
+                f.write(html)
+    except Exception as exc:
+        print(f"[warning] Could not apply fullscreen CSS to {filename}: {exc}")
+
+
 def visualize_combined_dashboard(g, louvain_partition, hybrid_partition, filename):
-    """Generate visualizations for both Louvain and Hybrid methods (refactored).
-    Writes canonical legend JSON based on g.nodes[node]['community_label'].
+    """Generate the user-facing Hybrid visualization.
+
+    Louvain stays in the pipeline for internal comparisons and reports, but no
+    Louvain graph, similarity graph, legend, or iframe is written to root.
     """
-    # Generate paths
-    louvain_html = filename.replace("dashboard_", "louvain_graph_")
     hybrid_html = filename.replace("dashboard_", "hybrid_graph_")
     legend_path = filename.replace(".html", "_legend.json")
 
-    net1 = create_community_network()
     net2 = create_community_network()
 
     if g.number_of_nodes() == 0:
-        empty_data = {"louvain": {"groups": {}}, "hybrid": {"groups": {}}}
+        empty_data = {"hybrid": {"groups": {}}}
         with open(legend_path, 'w', encoding='utf-8') as f:
             json.dump(empty_data, f, ensure_ascii=False, indent=2)
-        net1.save_graph(louvain_html)
-        net2.save_graph(hybrid_html)
-        print(f"[saved] {louvain_html}, {hybrid_html}, {legend_path}")
+        save_network_html(net2, hybrid_html)
+        save_hybrid_graph_json(g, hybrid_partition, hybrid_html)
+        print(f"[saved] {hybrid_html}, {legend_path}")
         return
 
-    # build visualizations and style partitions (this will also attach community_label to nodes)
-    louvain_colors = build_community_visualization(g, louvain_partition, net1, "Louvain")
-    louvain_colors = style_partition(g, net1, louvain_partition, "louvain", 47)
+    # Build only the visual partition shown to users.
     hybrid_colors = build_community_visualization(g, hybrid_partition, net2, "Hybrid")
     hybrid_colors = style_partition(g, net2, hybrid_partition, "hybrid", 200)
 
-    # Save networks
-    net1.save_graph(louvain_html)
-    net2.save_graph(hybrid_html)
-    print(f"[saved] {louvain_html}, {hybrid_html}")
+    save_network_html(net2, hybrid_html)
+    save_hybrid_graph_json(g, hybrid_partition, hybrid_html)
+    print(f"[saved] {hybrid_html}")
+
+    # Save only the user-facing community-level similarity graph.
+    save_community_similarity_graph(g, hybrid_partition, "hybrid", filename)
 
     legend_data = {
-        "louvain": {"groups": louvain_colors},
         "hybrid": {"groups": hybrid_colors}
     }
 
@@ -1249,14 +2523,16 @@ def visualize_combined_dashboard(g, louvain_partition, hybrid_partition, filenam
         pass
 
     with open(legend_path, 'w', encoding='utf-8') as f:
-        json.dump(legend_data, f, ensure_ascii=False, indent=2)
+        json.dump(sanitize_json(legend_data), f, ensure_ascii=False, indent=2)
     print(f"[saved] {legend_path}")
 
     # read utils and generate dashboard
     with open("lib/bindings/utils.js", encoding='utf-8') as f:
         utils_js = f.read()
 
-    dashboard_html = generate_dashboard_html(louvain_html, hybrid_html, legend_path, utils_js)
+    dashboard_html = generate_dashboard_html(
+        hybrid_html, legend_path, utils_js, legend_data
+    )
     with open(filename, 'w', encoding='utf-8') as f:
         f.write(dashboard_html)
     print(f"[saved] {filename}")
@@ -1446,12 +2722,10 @@ def process_community_data(method_name, partition, centers, community_texts):
             community_labels.add(name)
         else:
             # Fallback: use center node characteristics
-            name = f"جامعه {center} و همفکران"
-            
-            # Ensure uniqueness for fallback names too
-            while name in community_labels:
-                name = f"جامعه {center} و همراهان"
+            name = DEFAULT_COMMUNITY_LABEL
             community_labels.add(name)
+
+        name = coerce_allowed_label(name, default=DEFAULT_COMMUNITY_LABEL)
         
         # Store detailed community info
         active_member_info = [
@@ -1478,7 +2752,6 @@ def generate_legend_data(g, louvain_partition, hybrid_partition,
     """Generate legend data in the correct format for dashboard display."""
     if g.number_of_nodes() == 0:
         return {
-            "louvain": {"groups": {}},
             "hybrid": {"groups": {}}
         }
 
@@ -1510,29 +2783,9 @@ def generate_legend_data(g, louvain_partition, hybrid_partition,
                 else:
                     hybrid_groups[label]["count"] += 1
 
-    return {
-        "louvain": {"groups": louvain_groups},
-        "hybrid": {"groups": hybrid_groups}
-    }
-    
-    # Initialize and process graphs
-    for net, label, partition, filename in [
-        (net1, "Louvain", louvain_partition, louvain_html),
-        (net2, "Hybrid", hybrid_partition, hybrid_html)
-    ]:
-        net.from_nx(g)
-        # Network options already applied during initialization
-        colors = style_partition(g, net, partition, label, 47)
-        net.save_graph(filename)
-        print(f"[regenerated] {filename}")
-        if label == "Louvain":
-            louvain_label_colors = colors
-        else:
-            hybrid_label_colors = colors
-    print(f"[regenerated] {hybrid_html}")
+    return {"hybrid": {"groups": hybrid_groups}}
 
-    # Generate optimized HTML with improved styling
-    # Build legend HTML for each method
+
 def initialize_community_names():
     """Initialize the community names file."""
     try:
@@ -1547,6 +2800,9 @@ def build_community_visualization(g, partition, network, method="Unknown"):
     """Build network visualization - uses names from ai_name_community."""
     # Initialize network with graph data
     network.from_nx(g)
+    apply_edge_widths(network, g)
+    method_key = normalize_method_key(method)
+    meta_map = g.graph.get("meta_map", {})
     
     # Find community centers
     centers = get_community_centers(g, partition)
@@ -1562,8 +2818,11 @@ def build_community_visualization(g, partition, network, method="Unknown"):
         if not center:
             continue
         
-        # Use center name as label (simple for visualization)
-        label = f"جامعه {center}"
+        label = get_stored_community_label(g, method_key, comm_id, center)
+        if not label:
+            neighbors = [n for n in members if n != center]
+            label = ai_name_community(center, neighbors, NODE_LABEL_MAP, comm_id, method_key, g=g)
+        label = prefer_specific_political_label(label, members, meta_map)
         
         # Get active members
         active = sorted(members, key=lambda x: g.degree(x), reverse=True)[:3]
@@ -1577,8 +2836,6 @@ def build_community_visualization(g, partition, network, method="Unknown"):
             'color': None  # Will be assigned below
         }
     
-    # Generate colors using golden angle
-    golden_angle = 0.618033988749895
     colors = {}  # Will map labels to colors
     
     # Sort communities by size
@@ -1589,17 +2846,19 @@ def build_community_visualization(g, partition, network, method="Unknown"):
     )
     
     # Assign colors and style nodes
-    for i, (comm_id, info) in enumerate(sorted_comms):
-        # Generate distinct color
-        hue = (i * 360 * golden_angle) % 360
-        saturation = min(70 + (info['size'] * 1.5), 90)
-        lightness = 55
-        
-        color = f"hsl({hue},{saturation}%,{lightness}%)"
+    stance_map = g.graph.get("stance_map", {})
+    topic_label = g.graph.get("topic_label")
+    for comm_id, info in sorted_comms:
+        color = get_community_label_color(info['label'])
         info['color'] = color
         colors[info['label']] = color
         
         # Style community nodes
+        summary, _ = aggregate_community_metadata(info["members"], meta_map)
+        stance_info = compute_community_stance(info["label"], info["members"], stance_map, topic_label=topic_label)
+        if stance_info:
+            summary["stance"] = stance_info
+        meta_summary = format_meta_summary(summary)
         for node in info['members']:
             is_center = (node == info['center'])
             is_active = node in info['active']
@@ -1621,6 +2880,8 @@ def build_community_visualization(g, partition, network, method="Unknown"):
             if roles:
                 tooltip += f" ({' - '.join(roles)})"
             tooltip += f"\nجامعه: {info['label']}"
+            if meta_summary:
+                tooltip += f"\n{meta_summary}"
             
             # Update node styling
             node_data = network.get_node(node)
@@ -1629,13 +2890,14 @@ def build_community_visualization(g, partition, network, method="Unknown"):
                 'label': node,
                 'title': tooltip,
                 'size': size,
+                'community_label': info['label'],
                 'borderWidth': 2 if is_center else 1,
                 'borderWidthSelected': 3,
                 'font': {'size': 14, 'face': 'Vazirmatn'}
             })
     
     # Optimize network display
-    network.options.update({
+    network_options = {
         "physics": {
             "stabilization": {
                 "enabled": True,
@@ -1652,16 +2914,19 @@ def build_community_visualization(g, partition, network, method="Unknown"):
             "width": 0.5,
             "smooth": {"enabled": False}
         }
-    })
+    }
+    if hasattr(network.options, "update"):
+        network.options.update(network_options)
+    else:
+        network.options = network_options
     
     return colors
 
 
-def generate_dashboard_html(louvain_html, hybrid_html, legend_path, utils_js):
-    """Generate the HTML for the combined dashboard.
+def generate_dashboard_html(hybrid_html, legend_path, utils_js, legend_data=None):
+    """Generate the HTML for the user-facing Hybrid dashboard.
     
     Args:
-        louvain_html: Path to the Louvain algorithm HTML visualization file
         hybrid_html: Path to the hybrid algorithm HTML visualization file
         legend_path: Path to the JSON file containing legend data
         utils_js: JavaScript utility functions to include in the page
@@ -1670,51 +2935,70 @@ def generate_dashboard_html(louvain_html, hybrid_html, legend_path, utils_js):
         str: The complete HTML document as a string
     
     Notes:
-        The dashboard displays two interactive network visualizations side by side:
-        one for the Louvain community detection algorithm and one for the hybrid approach.
-        Each visualization has its own legend showing community labels and member counts.
+        Louvain stays available for internal comparison metrics, but it is not
+        rendered or linked in the visual output.
     """
     style = '''
+        html, body {
+            height: 100%;
+        }
         body {
             font-family: Vazirmatn, Tahoma, Arial, sans-serif;
             margin: 0;
-            padding: 20px;
+            padding: 0;
             direction: rtl;
-            background-color: #f5f6fa;
+            background-color: #ffffff;
             color: #2c3e50;
+            overflow: hidden;
         }
         h1, h2, h3 {
             color: #2c3e50;
             text-align: center;
-            margin: 15px 0;
+            margin: 0;
+        }
+        h1 {
+            display: none;
         }
         .container {
-            display: grid;
-            grid-template-columns: repeat(2, 1fr);
-            gap: 20px;
-            margin: 20px auto;
-            max-width: 1800px;
-        }
-        .graph-section {
-            background: white;
-            border-radius: 8px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            padding: 15px;
             display: flex;
             flex-direction: column;
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            padding: 10px;
+            box-sizing: border-box;
+            max-width: none;
+            min-height: 0;
+        }
+        .graph-section {
+            background: #ffffff;
+            border: 1px solid #dfe3e8;
+            border-radius: 6px;
+            padding: 8px;
+            display: flex;
+            flex-direction: column;
+            flex: 1 1 auto;
+            min-width: 0;
+            min-height: 0;
+            height: 100%;
+        }
+        .graph-section h2 {
+            font-size: 18px;
+            line-height: 1.4;
+            padding: 0 0 8px;
+            flex: 0 0 auto;
         }
         iframe {
             border: none;
             width: 100%;
-            height: 500px;
-            border-radius: 4px;
-            margin-bottom: 20px;
+            height: 100%;
+            flex: 1 1 auto;
+            min-height: 0;
+            border-radius: 3px;
+            margin: 0;
         }
         .legend {
-            background: #f8f9fa;
-            border-radius: 8px;
-            padding: 15px;
-            margin-top: auto;
+            display: none;
         }
         .legend-grid {
             display: grid;
@@ -1724,7 +3008,9 @@ def generate_dashboard_html(louvain_html, hybrid_html, legend_path, utils_js):
         }
         .legend-item {
             display: flex;
+            flex-wrap: wrap;
             align-items: center;
+            gap: 4px;
             padding: 8px;
             background: white;
             border-radius: 4px;
@@ -1739,6 +3025,7 @@ def generate_dashboard_html(louvain_html, hybrid_html, legend_path, utils_js):
         }
         .label {
             flex: 1;
+            min-width: 120px;
             font-size: 14px;
         }
         .count {
@@ -1746,41 +3033,105 @@ def generate_dashboard_html(louvain_html, hybrid_html, legend_path, utils_js):
             font-size: 12px;
             margin-right: 8px;
         }
+        .meta {
+            display: block;
+            flex-basis: 100%;
+            font-size: 12px;
+            color: #6c757d;
+            margin-right: 24px;
+            line-height: 1.6;
+        }
         @media (max-width: 1200px) {
-            .container {
-                grid-template-columns: 1fr;
-            }
             .legend-grid {
                 grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
             }
         }
     '''
     
+    embedded_legend_json = json.dumps(
+        sanitize_json(legend_data or {}),
+        ensure_ascii=False
+    )
+
     js_code = f'''
+        const embeddedLegendData = {embedded_legend_json};
+
         async function loadLegends() {{
             try {{
-                const response = await fetch("{legend_path}");
-                const data = await response.json();
+                let data = embeddedLegendData;
+                if (!data || !data.hybrid) {{
+                    const response = await fetch("{legend_path}");
+                    data = await response.json();
+                }}
+
+                const metaLabels = {{
+                    political_label: "گرایش سیاسی",
+                    category: "موضوع",
+                    emotion: "احساس",
+                    sentiment: "حس",
+                    language: "زبان"
+                }};
+
+                function formatMeta(meta) {{
+                    if (!meta) return '';
+                    const parts = [];
+                    if (meta.stance) {{
+                        if (typeof meta.stance === 'object') {{
+                            const target = meta.stance.target;
+                            const stance = meta.stance.stance;
+                            if (stance) {{
+                                parts.push(
+                                    target
+                                        ? `موضع نسبت به ${{target}}: ${{stance}}`
+                                        : `موضع: ${{stance}}`
+                                );
+                            }}
+                        }} else {{
+                            parts.push(`موضع: ${{meta.stance}}`);
+                        }}
+                    }}
+                    for (const [key, label] of Object.entries(metaLabels)) {{
+                        if (meta[key]) {{
+                            parts.push(`${{label}}: ${{meta[key]}}`);
+                        }}
+                    }}
+                    if (meta.echo) {{
+                        const echo = meta.echo;
+                        if (echo.is_echo_chamber !== undefined && echo.is_echo_chamber !== null) {{
+                            parts.push(`اتاق پژواک: ${{echo.is_echo_chamber ? "بله" : "خیر"}}`);
+                        }}
+                        if (typeof echo.ei_index === "number") {{
+                            parts.push(`E-I: ${{echo.ei_index.toFixed(2)}}`);
+                        }}
+                        if (typeof echo.conductance === "number") {{
+                            parts.push(`هدایت: ${{echo.conductance.toFixed(2)}}`);
+                        }}
+                        if (typeof echo.content_homogeneity === "number") {{
+                            parts.push(`همگنی: ${{echo.content_homogeneity.toFixed(2)}}`);
+                        }}
+                    }}
+                    return parts.join(' | ');
+                }}
                 
                 function buildLegendHTML(groups) {{
-                    const items = Object.entries(groups).map(([label, info]) => 
-                        `<div class="legend-item">
+                    const items = Object.entries(groups).map(([label, info]) =>
+                        (function() {{
+                            const meta = info.meta ? formatMeta(info.meta) : '';
+                            return `<div class="legend-item">
                         <span class="color-box" style="background:${{info.color}}"></span>
                         <span class="label">${{label}}</span>
                         <span class="count">(${{info.count}} عضو)</span>
-                        </div>`
+                        ${{meta ? `<span class="meta">${{meta}}</span>` : ''}}
+                        </div>`;
+                        }})()
                     );
                     return `<div class="legend-grid">${{items.join('')}}</div>`;
                 }}
                 
-                const [louvainLegend, hybridLegend] = [
-                    document.getElementById("louvain-legend"),
-                    document.getElementById("hybrid-legend")
-                ];
+                const hybridLegend = document.getElementById("hybrid-legend");
                 
-                data.louvain?.groups && 
-                    (louvainLegend.innerHTML = buildLegendHTML(data.louvain.groups));
                 data.hybrid?.groups && 
+                    hybridLegend &&
                     (hybridLegend.innerHTML = buildLegendHTML(data.hybrid.groups));
             }} catch (error) {{
                 console.error("Error loading legends:", error);
@@ -1793,14 +3144,8 @@ def generate_dashboard_html(louvain_html, hybrid_html, legend_path, utils_js):
     <h1>تشخیص جوامع در شبکه اجتماعی</h1>
     <div class="container">
         <div class="graph-section">
-            <h2>الگوریتم لووین</h2>
-            <iframe src="{louvain_html}"></iframe>
-            <div id="louvain-legend" class="legend"></div>
-        </div>
-        <div class="graph-section">
             <h2>روش ترکیبی</h2>
             <iframe src="{hybrid_html}"></iframe>
-            <div id="hybrid-legend" class="legend"></div>
         </div>
     </div>
     '''
@@ -1818,311 +3163,6 @@ def generate_dashboard_html(louvain_html, hybrid_html, legend_path, utils_js):
 <script>{js_code}</script>
 </body>
 </html>'''
-    html = ["""<!DOCTYPE html>
-<html lang="fa" dir="rtl">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>تشخیص جوامع در شبکه اجتماعی</title>"""]
-    html.append('    <script type="text/javascript">')
-    html.append(utils_js)
-    html.append('    </script>')
-    html.append("""    <style>
-        body {
-            font-family: Vazirmatn, Tahoma, Arial, sans-serif;
-            margin: 0;
-            padding: 20px;
-            direction: rtl;
-            background-color: #f5f6fa;
-            color: #2c3e50;
-        }
-        h1, h2, h3 {
-            color: #2c3e50;
-            text-align: center;
-            margin: 15px 0;
-        }
-        .container {
-            display: grid;
-            grid-template-columns: repeat(2, 1fr);
-            gap: 20px;
-            margin: 20px auto;
-            max-width: 1800px;
-        }
-        .graph-section {
-            background: white;
-            border-radius: 8px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            padding: 15px;
-            display: flex;
-            flex-direction: column;
-        }
-        iframe {
-            border: none;
-            width: 100%;
-            height: 500px;
-            border-radius: 4px;
-            margin-bottom: 20px;
-        }
-        .legend {
-            background: #f8f9fa;
-            border-radius: 8px;
-            padding: 15px;
-            margin-top: auto;
-        }
-        .legend-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-            gap: 10px;
-            margin-top: 10px;
-        }
-        .legend-item {
-            display: flex;
-            align-items: center;
-            padding: 8px;
-            background: white;
-            border-radius: 4px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-        }
-        .color-box {
-            width: 16px;
-            height: 16px;
-            border-radius: 4px;
-            margin-left: 8px;
-            border: 1px solid rgba(0,0,0,0.1);
-        }
-        .label {
-            flex: 1;
-            font-size: 14px;
-        }
-        .count {
-            color: #666;
-            font-size: 12px;
-            margin-right: 8px;
-        }
-        @media (max-width: 1200px) {
-            .container {
-                grid-template-columns: 1fr;
-            }
-            .legend-grid {
-                grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-            }
-        }
-    </style>
-</head>
-<body>
-    <h1>تشخیص جوامع در شبکه اجتماعی</h1>
-    <div class="container">
-        <div class="graph-section">
-            <h2>الگوریتم لووین</h2>
-            <iframe src="{louvain}"></iframe>
-            <div id="louvain-legend" class="legend"><!-- Legend will be loaded here --></div>
-        </div>
-        <div class="graph-section">
-            <h2>روش ترکیبی</h2>
-            <iframe src="{hybrid}"></iframe>
-            <div id="hybrid-legend" class="legend"><!-- Legend will be loaded here --></div>
-        </div>
-    </div>
-    <script>
-        async function loadLegends() {
-            try {
-                const response = await fetch("{legend}");
-                const data = await response.json();
-                
-                function buildLegendHTML(groups) {
-                    let html = ['<div class="legend-grid">'];
-                    for (let [label, info] of Object.entries(groups)) {
-                        html.push(`
-                            <div class="legend-item">
-                                <span class="color-box" style="background:${info.color}"></span>
-                                <span class="label">${label}</span>
-                                <span class="count">(${info.count} عضو)</span>
-                            </div>
-                        `);
-                    }
-                    html.push('</div>');
-                    return html.join('\\n');
-                }
-                
-                if (data.louvain && data.louvain.groups) {
-                    document.getElementById("louvain-legend").innerHTML = buildLegendHTML(data.louvain.groups);
-                }
-                
-                if (data.hybrid && data.hybrid.groups) {
-                    document.getElementById("hybrid-legend").innerHTML = buildLegendHTML(data.hybrid.groups);
-                }
-            } catch (error) {
-                console.error("Error loading legends:", error);
-            }
-        }
-        
-        window.addEventListener("load", loadLegends);
-    </script>
-</body>
-</html>""".format(
-        louvain=louvain_html,
-        hybrid=hybrid_html,
-        legend=legend_path
-    )).join('\\n')
-    
-    return template.format(
-        louvain_html=louvain_html,
-        hybrid_html=hybrid_html,
-        legend_path=legend_path,
-        utils_js=utils_js
-    )
-    html.append(f'    <script>{utils_js}</script>')
-    html.append('    <style>')
-    html.append('        :root {')
-    html.append('            --primary-color: #2c3e50;')
-    html.append('            --secondary-color: #34495e;')
-    html.append('            --border-color: #bdc3c7;')
-    html.append('            --hover-color: #3498db;')
-    html.append('        }')
-    html.append('        body {')
-    html.append('            font-family: Vazirmatn, Tahoma, Arial, sans-serif;')
-    html.append('            margin: 0;')
-    html.append('            padding: 20px;')
-    html.append('            direction: rtl;')
-    html.append('            background-color: #f5f6fa;')
-    html.append('            color: var(--primary-color);')
-    html.append('        }')
-    html.append('        h1, h2, h3 {')
-    html.append('            color: var(--primary-color);')
-    html.append('            text-align: center;')
-    html.append('            margin: 15px 0;')
-    html.append('        }')
-    html.append('        .container {')
-    html.append('            display: grid;')
-    html.append('            grid-template-columns: repeat(2, 1fr);')
-    html.append('            gap: 20px;')
-    html.append('            margin: 20px auto;')
-    html.append('            max-width: 1800px;')
-    html.append('        }')
-    html.append('        .graph-section {')
-    html.append('            background: white;')
-    html.append('            border-radius: 8px;')
-    html.append('            box-shadow: 0 2px 4px rgba(0,0,0,0.1);')
-    html.append('            padding: 15px;')
-    html.append('            display: flex;')
-    html.append('            flex-direction: column;')
-    html.append('        }')
-    html.append('        iframe {')
-    html.append('            border: none;')
-    html.append('            width: 100%;')
-    html.append('            height: 500px;')
-    html.append('            border-radius: 4px;')
-    html.append('            margin-bottom: 20px;')
-    html.append('        }')
-    html.append('        .legend {')
-    html.append('            background: #f8f9fa;')
-    html.append('            border-radius: 8px;')
-    html.append('            padding: 15px;')
-    html.append('            margin-top: auto;')
-    html.append('        }')
-    html.append('        .legend-grid {')
-    html.append('            display: grid;')
-    html.append('            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));')
-    html.append('            gap: 10px;')
-    html.append('            margin-top: 10px;')
-    html.append('        }')
-    html.append('        .legend-item {')
-    html.append('            display: flex;')
-    html.append('            align-items: center;')
-    html.append('            padding: 8px;')
-    html.append('            background: white;')
-    html.append('            border-radius: 4px;')
-    html.append('            box-shadow: 0 1px 3px rgba(0,0,0,0.1);')
-    html.append('        }')
-    html.append('        .color-box {')
-    html.append('            width: 16px;')
-    html.append('            height: 16px;')
-    html.append('            border-radius: 4px;')
-    html.append('            margin-left: 8px;')
-    html.append('            border: 1px solid rgba(0,0,0,0.1);')
-    html.append('        }')
-    html.append('        .label {')
-    html.append('            flex: 1;')
-    html.append('            font-size: 14px;')
-    html.append('        }')
-    html.append('        .count {')
-    html.append('            color: #666;')
-    html.append('            font-size: 12px;')
-    html.append('            margin-right: 8px;')
-    html.append('        }')
-    html.append('        @media (max-width: 1200px) {')
-    html.append('            .container {')
-    html.append('                grid-template-columns: 1fr;')
-    html.append('            }')
-    html.append('            .legend-grid {')
-    html.append('                grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));')
-    html.append('            }')
-    html.append('        }')
-    html.append('    </style>')
-    html.append('</head>')
-    html.append('<body>')
-    html.append('    <h1>تشخیص جوامع در شبکه اجتماعی</h1>')
-    html.append('    <div class="container">')
-    html.append('        <div class="graph-section">')
-    html.append('            <h2>الگوریتم لووین</h2>')
-    html.append(f'            <iframe src="{louvain_html}"></iframe>')
-    html.append('            <div id="louvain-legend"><!-- Legend will be loaded here --></div>')
-    html.append('        </div>')
-    html.append('        <div class="graph-section">')
-    html.append('            <h2>روش ترکیبی</h2>')
-    html.append(f'            <iframe src="{hybrid_html}"></iframe>')
-    html.append('            <div id="hybrid-legend"><!-- Legend will be loaded here --></div>')
-    html.append('        </div>')
-    html.append('    </div>')
-    html.append('    ')
-    html.append('    <script>')
-    html.append('        async function loadLegends() {')
-    html.append('            try {')
-    html.append(f'                const response = await fetch("{legend_path}");')
-    html.append('                const data = await response.json();')
-    html.append('                ')
-    html.append('                function buildLegendHTML(groups) {')
-    html.append("                    let html = ['<div class=\"legend\">', '<div class=\"legend-grid\">'];")
-    html.append('                    ')
-    html.append('                    Object.entries(groups).forEach(([label, info]) => {')
-    html.append('                        html.push(`')
-    html.append('                            <div class="legend-item">')
-    html.append('                                <span class="color-box" style="background:${info.color}"></span>')
-    html.append('                                <span class="label">${label}</span>')
-    html.append('                                <span class="count">(${info.count} عضو)</span>')
-    html.append('                            </div>')
-    html.append('                        `);')
-    html.append('                    });')
-    html.append('                    ')
-    html.append("                    html.push('</div>', '</div>');")
-    html.append("                    return html.join('\\n');")
-    html.append('                }')
-    html.append('                ')
-    html.append('                // Update both legends')
-    html.append('                if (data.louvain && data.louvain.groups) {')
-    html.append('                    document.getElementById("louvain-legend").innerHTML = ')
-    html.append('                        buildLegendHTML(data.louvain.groups);')
-    html.append('                }')
-    html.append('                ')
-    html.append('                if (data.hybrid && data.hybrid.groups) {')
-    html.append('                    document.getElementById("hybrid-legend").innerHTML = ')
-    html.append('                        buildLegendHTML(data.hybrid.groups);')
-    html.append('                }')
-    html.append('                ')
-    html.append('            } catch (error) {')
-    html.append('                console.error("Error loading legends:", error);')
-    html.append('            }')
-    html.append('        }')
-    html.append('        ')
-    html.append('        // Load legends when the page loads')
-    html.append('        window.addEventListener("load", loadLegends);')
-    html.append('    </script>')
-    html.append('</body>')
-    html.append('</html>')
-    
-    return '\n'.join(html)
-
-
 def save_community_name(community_name: str, center_node: str, neighbors: list, 
                        comm_id: int, method: str, time_period: str = None):
     """Save a community name and its details to the community names file."""
@@ -2203,109 +3243,50 @@ def fetch_community_texts_from_file(center_node, neighbors, filepath="res.json",
 
 
 def process_visualization(g, louvain_partition, hybrid_partition, filename):
-    """Process community detection visualization for both methods."""
-    # Generate paths
-    louvain_html = filename.replace("dashboard_", "louvain_graph_")
+    """Process the user-facing Hybrid visualization."""
     hybrid_html = filename.replace("dashboard_", "hybrid_graph_")
     legend_path = filename.replace(".html", "_legend.json")
-
-    # Create networks
-    net1 = create_community_network()
-    net2 = create_community_network()
-
-    # Handle empty graph case
-    if g.number_of_nodes() == 0:
-        empty_data = {"louvain": {"groups": []}, "hybrid": {"groups": []}}
-        with open(legend_path, 'w', encoding='utf-8') as f:
-            json.dump(empty_data, f, ensure_ascii=False, indent=2)
-        
-        # Save empty networks
-        net1.save_graph(louvain_html)
-        net2.save_graph(hybrid_html)
-        return
-
-    # Build visualizations with updated legend data
-    build_community_visualization(g, louvain_partition, net1, "Louvain")
-    build_community_visualization(g, hybrid_partition, net2, "Hybrid")
-    
-    # Save networks
-    net1.save_graph(louvain_html)
-    net2.save_graph(hybrid_html)
-    print(f"[saved] {louvain_html}, {hybrid_html}")
-    
-    # Extract legend data from network options
-    legend_data = {
-        "louvain": {"groups": net1.options.get('groups', [])},
-        "hybrid": {"groups": net2.options.get('groups', [])}
-    }
-
-    # Save legend data
-    with open(legend_path, 'w', encoding='utf-8') as f:
-        json.dump(legend_data, f, ensure_ascii=False, indent=2)
-    print(f"[saved] {legend_path}")
-
-    # Generate dashboard HTML
-    with open("lib/bindings/utils.js", encoding='utf-8') as f:
-        utils_js = f.read()
-        
-    dashboard_html = generate_dashboard_html(
-        louvain_html, hybrid_html, legend_path, utils_js
-    )
-    
-    # Write the final dashboard
-    with open(filename, 'w', encoding='utf-8') as f:
-        f.write(dashboard_html)
-    print(f"[saved] {filename}")
-    
-    return louvain_html, hybrid_html, legend_path
-
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write(combined_html)
-    
-    # Write enhanced legend
-    legend_data = {
-        "louvain": {
-            "title": "جوامع شناسایی شده توسط الگوریتم لووین",
-            "groups": {
-                label: {
-                    "color": color,
-                    "count": sum(1 for node, comm in louvain_partition.items()
-                               if net1.get_node(node)['title'].endswith(f"({label})"))
-                }
-                for label, color in louvain_label_colors.items()
-            }
-        },
-        "hybrid": {
-            "title": "جوامع شناسایی شده توسط روش ترکیبی",
-            "groups": {
-                label: {
-                    "color": color,
-                    "count": sum(1 for node, comm in hybrid_partition.items()
-                               if net2.get_node(node)['title'].endswith(f"({label})"))
-                }
-                for label, color in hybrid_label_colors.items()
-            }
-        }
-    }
-    
-    with open(legend_path, "w", encoding="utf-8") as f:
-        json.dump(legend_data, f, indent=2, ensure_ascii=False)
-    print(f"[legend regenerated] {legend_path}")
-    print(f"Combined dashboard saved to {filename}")
+    visualize_combined_dashboard(g, louvain_partition, hybrid_partition, filename)
+    return hybrid_html, legend_path
 
 
 def generate_time_slots(start_date, end_date, slot_type):
     slots = []
-    current = start_date
-    while current <= end_date:
-        if slot_type == "daily":
-            next_slot = current + timedelta(days=1)
-        elif slot_type == "weekly":
-            next_slot = current + timedelta(weeks=1)
-        else:  # monthly
-            next_slot = current + relativedelta(months=1)
+    range_start = datetime.combine(start_date.date(), datetime.min.time())
+    range_end = datetime.combine(end_date.date(), datetime.max.time())
+    total_days = inclusive_day_count(range_start, range_end)
+    current = range_start
 
-        slot_end = min(next_slot - timedelta(days=1), end_date)
+    if slot_type == "weekly" and 29 <= total_days <= 31:
+        for idx in range(4):
+            if current > range_end:
+                break
+            if idx == 3:
+                slot_end = range_end
+            else:
+                slot_end = min(current + timedelta(days=7) - timedelta(microseconds=1), range_end)
+            slots.append((current, slot_end))
+            current = slot_end + timedelta(microseconds=1)
+        return slots
+
+    while current <= range_end:
+        if slot_type == "hourly":
+            next_slot = current + timedelta(hours=1)
+            slot_end = min(next_slot - timedelta(microseconds=1), range_end)
+        elif slot_type == "daily":
+            next_slot = current + timedelta(days=1)
+            slot_end = min(next_slot - timedelta(microseconds=1), range_end)
+        elif slot_type == "weekly":
+            next_slot = current + timedelta(days=7)
+            slot_end = min(next_slot - timedelta(microseconds=1), range_end)
+        elif slot_type == "monthly":
+            next_slot = current + relativedelta(months=1)
+            slot_end = min(next_slot - timedelta(microseconds=1), range_end)
+        elif slot_type == "quarterly":
+            next_slot = current + relativedelta(months=3)
+            slot_end = min(next_slot - timedelta(microseconds=1), range_end)
+        else:
+            raise ValueError(f"Unsupported slot type: {slot_type}")
         slots.append((current, slot_end))
         current = next_slot
     return slots
@@ -2314,125 +3295,235 @@ def generate_time_slots(start_date, end_date, slot_type):
 # --- Timeline Dashboard Generator ---
 import os
 
-def generate_timeline_dashboard(output_file="timeline_dashboard.html", slot_type="monthly"):
-    """
-    Generates an interactive dashboard that allows switching between time slot graphs.
-    """
-    def parse_slot_range(filename: str):
-        """Extract datetime range from dashboard filename."""
+def normalize_topic_key(label):
+    value = (label or "").strip()
+    if not value:
+        return "__topic__"
+    key = re.sub(r"\s+", "_", value)
+    key = re.sub(r"[^\w#آ-ی\u200c_-]+", "_", key, flags=re.UNICODE)
+    return key.strip("_") or "__topic__"
+
+
+def load_topic_options(file_path="topics_10.csv", active_label=None, active_query=None):
+    """Load lightweight topic presets for the static dashboard selector."""
+    options = []
+    seen = set()
+
+    def add_option(label, query="", has_data=False):
+        clean_label = (label or "").strip()
+        if not clean_label:
+            return
+        key = normalize_topic_key(clean_label)
+        if key in seen:
+            return
+        seen.add(key)
+        options.append({
+            "key": key,
+            "label": clean_label,
+            "query": (query or clean_label).strip(),
+            "hasData": bool(has_data),
+        })
+
+    add_option(active_label, active_query or active_label, has_data=True)
+
+    if os.path.exists(file_path):
         try:
-            parts = os.path.splitext(os.path.basename(filename))[0].split("_")
-            start_token = parts[1]
-            end_token = parts[3]
-            start_dt = datetime.strptime(start_token, "%y%m%d")
-            end_dt = datetime.strptime(end_token, "%y%m%d")
+            with open(file_path, "r", encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    add_option(
+                        row.get("topic_label"),
+                        row.get("topic_query"),
+                        has_data=False,
+                    )
+        except Exception as exc:
+            print(f"[warning] Could not load topic options from {file_path}: {exc}")
+
+    return options
+
+
+def load_topic_output_manifests(base_dir="topic_outputs"):
+    """Load previously generated per-topic timeline manifests."""
+    manifests = []
+    if not os.path.isdir(base_dir):
+        return manifests
+
+    for name in sorted(os.listdir(base_dir)):
+        manifest_path = os.path.join(base_dir, name, "topic_manifest.json")
+        if not os.path.exists(manifest_path):
+            continue
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+            if manifest.get("key") and manifest.get("modes"):
+                for mode in (manifest.get("modes") or {}).values():
+                    for item in mode.get("items", []):
+                        dashboard = item.get("dashboard")
+                        if dashboard:
+                            item["dashboard"] = quote(
+                                unquote(str(dashboard)),
+                                safe="/._-",
+                            )
+                manifests.append(manifest)
+        except Exception as exc:
+            print(f"[warning] Could not load topic manifest {manifest_path}: {exc}")
+    return manifests
+
+
+def build_timeline_topics(topic_label, timeline_modes, topic_options=None):
+    active_key = normalize_topic_key(topic_label)
+    options = topic_options or load_topic_options(active_label=topic_label)
+    topics = {}
+
+    for option in options:
+        key = option.get("key") or normalize_topic_key(option.get("label"))
+        topics[key] = {
+            "label": option.get("label") or key,
+            "query": option.get("query") or option.get("label") or key,
+            "hasData": bool(option.get("hasData")),
+            "modes": {},
+        }
+
+    known_option_keys = {option.get("key") for option in options}
+    for manifest in load_topic_output_manifests():
+        key = manifest.get("key")
+        label = manifest.get("label") or key
+        topics[key] = {
+            "label": label,
+            "query": manifest.get("query") or label,
+            "hasData": True,
+            "modes": manifest.get("modes") or {},
+        }
+        if key not in known_option_keys:
+            options.append({
+                "key": key,
+                "label": label,
+                "query": manifest.get("query") or label,
+                "hasData": True,
+            })
+            known_option_keys.add(key)
+
+    topics.setdefault(active_key, {
+        "label": topic_label,
+        "query": topic_label,
+        "hasData": True,
+        "modes": {},
+    })
+    topics[active_key]["hasData"] = True
+    topics[active_key]["modes"] = timeline_modes
+    return active_key, topics, options
+
+
+def generate_timeline_dashboard(output_file="timeline_dashboard.html", topic_label=None,
+                                mode_dashboards=None, topic_options=None):
+    """Generate a dashboard that can switch between real slot modes."""
+    mode_labels = {
+        "hourly": "ساعتی",
+        "daily": "روزانه",
+        "weekly": "هفتگی",
+        "monthly": "ماهانه",
+        "quarterly": "فصلی",
+    }
+
+    def parse_slot_range(filename: str):
+        try:
+            match = re.search(
+                r"dashboard_(?:[a-z_]+_)?(\d{6,8})_to_(\d{6,8})\.html$",
+                os.path.basename(filename),
+            )
+            if not match:
+                return None, None
+            start_raw, end_raw = match.group(1), match.group(2)
+            start_fmt = "%y%m%d%H" if len(start_raw) == 8 else "%y%m%d"
+            end_fmt = "%y%m%d%H" if len(end_raw) == 8 else "%y%m%d"
+            start_dt = datetime.strptime(start_raw, start_fmt)
+            end_dt = datetime.strptime(end_raw, end_fmt)
             return start_dt, end_dt
         except Exception:
             return None, None
 
-    def legend_html(groups: Dict[str, Any]) -> str:
-        if not groups:
-            return '<div class="legend-item"><span class="label">بدون داده</span></div>'
-        items = []
-        for label, info in groups.items():
-            color = info.get("color", "#999999")
-            count = info.get("count", 0)
-            items.append(
-                f'''<div class="legend-item">
-    <span class="color-box" style="background:{color}"></span>
-    <span class="label">{label}</span>
-    <span class="count">({count} عضو)</span>
-</div>'''
-            )
-        return "\n".join(items)
-
-    dashboards_info = []
-    for f in sorted([f for f in os.listdir(".") if f.startswith("dashboard_") and f.endswith(".html") and "_to_" in f]):
-        legend_file = f.replace(".html", "_legend.json")
+    def load_legend(dashboard_file):
+        legend_file = dashboard_file.replace(".html", "_legend.json")
         if not os.path.exists(legend_file):
-            continue
+            return {"hybrid": {"groups": {}}}
         try:
-            with open(legend_file, "r", encoding="utf-8") as lf:
-                legends = json.load(lf)
-            louvain_groups = legends.get("louvain", {}).get("groups", {})
-            hybrid_groups = legends.get("hybrid", {}).get("groups", {})
-            if not louvain_groups and not hybrid_groups:
-                print(f"[skip] {f} has empty legends → deleting")
-                try:
-                    os.remove(f)
-                    if os.path.exists(legend_file):
-                        os.remove(legend_file)
-                except Exception as e:
-                    print(f"[cleanup failed] {e}")
-                continue
+            with open(legend_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return {"hybrid": data.get("hybrid", {"groups": {}})}
         except Exception:
-            continue
-        start_dt, end_dt = parse_slot_range(f)
-        if not start_dt or not end_dt:
-            range_label = "نامشخص"
-        else:
-            range_label = f"{start_dt.strftime('%Y-%m-%d')} تا {end_dt.strftime('%Y-%m-%d')}"
-        dashboards_info.append({"file": f, "range": range_label})
+            return {"hybrid": {"groups": {}}}
 
-    if not dashboards_info:
-        print("No dashboard_*.html files found.")
+    if mode_dashboards is None:
+        mode_dashboards = {"weekly": []}
+        for filename in sorted(
+            f for f in os.listdir(".")
+            if f.startswith("dashboard_") and f.endswith(".html") and "_to_" in f
+        ):
+            start_dt, end_dt = parse_slot_range(filename)
+            if not start_dt or not end_dt:
+                continue
+            mode_dashboards["weekly"].append({
+                "file": filename,
+                "start": start_dt.strftime("%Y-%m-%d"),
+                "end": end_dt.strftime("%Y-%m-%d"),
+            })
+
+    timeline_modes = {}
+    for mode, entries in mode_dashboards.items():
+        items = []
+        for entry in entries:
+            dashboard_file = entry.get("file")
+            if not dashboard_file or not os.path.exists(dashboard_file):
+                continue
+            start = entry.get("start")
+            end = entry.get("end")
+            if not start or not end:
+                start_dt, end_dt = parse_slot_range(dashboard_file)
+                start = start_dt.strftime("%Y-%m-%d") if start_dt else ""
+                end = end_dt.strftime("%Y-%m-%d") if end_dt else ""
+            items.append({
+                "dashboard": dashboard_file,
+                "range": f"{start} تا {end}" if start and end else "نامشخص",
+                "legends": load_legend(dashboard_file),
+                "partyFocus": entry.get("party_focus", {}),
+            })
+        if items:
+            base_label = mode_labels.get(mode, mode)
+            timeline_modes[mode] = {
+                "label": base_label,
+                "items": items,
+            }
+
+    if not timeline_modes:
+        print("No dashboard files found for timeline modes.")
         return
 
-    # Load legends for each dashboard
-    legends = {}
-    for entry in dashboards_info:
-        dash = entry["file"]
-        legend_file = dash.replace(".html", "_legend.json")
-        if os.path.exists(legend_file):
-            with open(legend_file, "r", encoding="utf-8") as f:
-                legends[dash] = json.load(f)
-        else:
-            legends[dash] = {"louvain": {"groups": {}}, "hybrid": {"groups": {}}}
+    if topic_label is None:
+        topic_label = load_topic_label_from_elastic() or "#همکاری_ملی"
 
-    # Generate graph containers HTML
-    graph_containers = []
-    graph_containers = []
-    slot_ranges = []
-    for i, entry in enumerate(dashboards_info):
-        dash = entry["file"]
-        slot_ranges.append(entry["range"])
-        lou_groups = legends.get(dash, {}).get("louvain", {}).get("groups", {})
-        hyb_groups = legends.get(dash, {}).get("hybrid", {}).get("groups", {})
-        container = f'''
-        <div id="container{i}" class="graph-container{' active' if i == 0 else ''}">
-            <iframe id="frame{i}" src="{dash}" title="{dash}"></iframe>
-            <div class="legend">
-                <strong>الگوریتم لووین ({dash}):</strong>
-                {legend_html(lou_groups)}
-            </div>
-            <div class="legend">
-                <strong>روش ترکیبی ({dash}):</strong>
-                {legend_html(hyb_groups)}
-            </div>
-        </div>
-        '''
-        graph_containers.append(container.strip())
+    preferred_defaults = ["weekly", "daily", "monthly", "quarterly", "hourly"]
+    default_mode = next(
+        (mode for mode in preferred_defaults if mode in timeline_modes),
+        next(iter(timeline_modes))
+    )
+    total_slots = len(timeline_modes[default_mode]["items"])
+    active_topic, timeline_topics, topic_options = build_timeline_topics(
+        topic_label,
+        timeline_modes,
+        topic_options=topic_options,
+    )
 
-    slot_type_map = {
-        "hourly": "نمایش ساعتی",
-        "daily": "نمایش روزانه",
-        "weekly": "نمایش هفتگی",
-        "monthly": "نمایش ماهانه"
-    }
-    slot_mode_label = slot_type_map.get(slot_type, f"نمایش {slot_type}")
-    dashboards = [entry["file"] for entry in dashboards_info]
-
-    # Read template and fill in values
     with open("timeline_template.html", "r", encoding="utf-8") as f:
         template = f.read()
 
     html = (
         template
-        .replace("{dashboard_list}", json.dumps(dashboards, ensure_ascii=False))
-        .replace("{slot_ranges}", json.dumps(slot_ranges, ensure_ascii=False))
-        .replace("{slot_mode_label}", json.dumps(slot_mode_label, ensure_ascii=False))
-        .replace("{graph_containers}", "\n".join(graph_containers))
-        .replace("{total_slots}", str(len(dashboards)))
+        .replace("{timeline_modes}", json.dumps(sanitize_json(timeline_modes), ensure_ascii=False))
+        .replace("{timeline_topics}", json.dumps(sanitize_json(timeline_topics), ensure_ascii=False))
+        .replace("{topic_options}", json.dumps(sanitize_json(topic_options), ensure_ascii=False))
+        .replace("{default_topic}", json.dumps(active_topic, ensure_ascii=False))
+        .replace("{default_mode}", json.dumps(default_mode, ensure_ascii=False))
+        .replace("{topic_label}", topic_label)
+        .replace("{total_slots}", str(total_slots))
     )
 
     with open(output_file, "w", encoding="utf-8") as f:
@@ -2442,6 +3533,9 @@ def generate_timeline_dashboard(output_file="timeline_dashboard.html", slot_type
 
 # Print community results
 if __name__ == "__main__":
+    removed = clean_project_root()
+    if removed:
+        print(f"[cleanup] Removed {len(removed)} generated artifacts from project root.")
     # پاکسازی فایل اسامی در شروع برنامه
     try:
         with open("community_names.txt", "w", encoding="utf-8") as f:
@@ -2450,50 +3544,126 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[error] Failed to initialize community names file: {e}")
     print("[start] Running Louvain and Hybrid community detection...")
-    start_date = datetime.strptime("2025-03-01", "%Y-%m-%d")
-    end_date = datetime.strptime("2025-07-20", "%Y-%m-%d")
-    delta_days = (end_date - start_date).days
-    if delta_days <= 7:
-        slot_type = "daily"
-    elif delta_days <= 60:
-        slot_type = "weekly"
-    else:
-        slot_type = "monthly"
-    print(f"[config] Slot type selected: {slot_type}")
-    slots = generate_time_slots(start_date, end_date, slot_type)
-    for idx, (slot_start, slot_end) in enumerate(slots):
-        _ai_name_cache.clear()
-        print(f"\n[slot {idx+1}/{len(slots)}] Processing: {slot_start.date()} to {slot_end.date()}...")
-        messages = []
-        all_messages = load_interactions()
-        for msg in all_messages:
-            date_str = msg.get("date")
-            if not date_str:
-                continue
-            try:
-                msg_date = datetime.strptime(date_str[:10], "%Y-%m-%d").date()
-                if slot_start.date() <= msg_date <= slot_end.date():
-                    messages.append(msg)
-            except Exception as e:
-                print(f"[skip] Invalid date format: {date_str} → {e}")
-                continue
-        if not messages:
-            print("[skip] No valid messages found in this time slot")
-            visualize_or_dummy(slot_start, slot_end, nx.Graph())
-            continue
-        g_slot = build_user_graph(messages)
-        g_slot = clean_graph(g_slot)
-        if g_slot.number_of_nodes() == 0:
-            print("[skip] Empty graph after filtering")
-            visualize_or_dummy(slot_start, slot_end, g_slot)
-            continue
-        partition_louvain = detect_communities_louvain(g_slot)
-        embeddings, nodes = get_node_embeddings(g_slot)
-        labels = run_kmeans(embeddings, n_clusters=5)
-        partition_hybrid = {node: labels[i] for i, node in enumerate(nodes)}
-        visualize_or_dummy(
-            slot_start, slot_end, g_slot,
-            partition_louvain, partition_hybrid
+    meta_map, stance_map = load_user_context()
+    config = load_pipeline_config()
+    topic_label = (
+        os.getenv("TOPIC_LABEL_OVERRIDE")
+        or config.get("topic_label")
+        or load_topic_label_from_elastic()
+        or "جنگ جمهوری اسلامی و آمریکا"
+    )
+    start_date, end_date = get_pipeline_date_range(config)
+    if start_date > end_date:
+        raise ValueError(
+            f"Invalid date range: {start_date.date()} is after {end_date.date()}"
         )
+
+    slot_modes = config.get("slot_modes") or select_slot_modes_for_range(start_date, end_date)
+    if isinstance(slot_modes, str):
+        slot_modes = [
+            mode.strip()
+            for mode in re.split(r"[,،;\s]+", slot_modes)
+            if mode.strip()
+        ]
+    valid_modes = {"hourly", "daily", "weekly", "monthly", "quarterly"}
+    slot_modes = [mode for mode in slot_modes if mode in valid_modes]
+    if not slot_modes:
+        slot_modes = select_slot_modes_for_range(start_date, end_date)
+
+    print(
+        "[config] topic={topic} range={start}..{end} modes={modes}".format(
+            topic=topic_label,
+            start=start_date.date(),
+            end=end_date.date(),
+            modes=", ".join(slot_modes),
+        )
+    )
+    all_messages = load_interactions()
+    mode_dashboards = {}
+
+    for slot_mode in slot_modes:
+        slots = generate_time_slots(start_date, end_date, slot_mode)
+        mode_dashboards[slot_mode] = []
+        previous_node_parties = {}
+        print(f"\n[mode] {slot_mode}: {len(slots)} slots")
+
+        for idx, (slot_start, slot_end) in enumerate(slots):
+            _ai_name_cache.clear()
+            print(
+                f"\n[slot {idx+1}/{len(slots)} | {slot_mode}] "
+                f"Processing: {slot_start.date()} to {slot_end.date()}..."
+            )
+            messages = []
+            for msg in all_messages:
+                date_str = msg.get("date")
+                msg_dt = parse_message_datetime(date_str)
+                if not msg_dt:
+                    print(f"[skip] Invalid date format: {date_str}")
+                    continue
+                if slot_start <= msg_dt <= slot_end:
+                    messages.append(msg)
+
+            dashboard_file = None
+            if not messages:
+                print("[skip] No valid messages found in this time slot")
+                dashboard_file = visualize_or_dummy(
+                    slot_start, slot_end, nx.Graph(), slot_mode=slot_mode
+                )
+            else:
+                g_slot = build_user_graph(messages)
+                g_slot = clean_graph(g_slot)
+                attach_metadata_to_graph(
+                    g_slot, meta_map, stance_map, topic_label=topic_label
+                )
+                if g_slot.number_of_nodes() == 0:
+                    print("[skip] Empty graph after filtering")
+                    dashboard_file = visualize_or_dummy(
+                        slot_start, slot_end, g_slot, slot_mode=slot_mode
+                    )
+                else:
+                    partition_louvain = detect_communities_louvain(g_slot)
+                    embeddings, nodes = get_node_embeddings(g_slot)
+                    labels = run_kmeans(embeddings, n_clusters=5)
+                    partition_hybrid = {
+                        node: labels[i] for i, node in enumerate(nodes)
+                    }
+                    report = build_hybrid_report(
+                        g_slot,
+                        embeddings,
+                        nodes,
+                        labels,
+                        louvain_partition=partition_louvain,
+                        start_date=format_slot_value(slot_start, slot_mode),
+                        end_date=format_slot_value(slot_end, slot_mode)
+                    )
+                    save_hybrid_report(report)
+                    dashboard_file = visualize_or_dummy(
+                        slot_start, slot_end, g_slot,
+                        partition_louvain, partition_hybrid,
+                        slot_mode=slot_mode,
+                    )
+                    party_changes = collect_node_party_changes(
+                        g_slot,
+                        previous_node_parties,
+                        current_slot=format_slot_value(slot_start, slot_mode),
+                        slot_mode=slot_mode,
+                        topic_label=topic_label,
+                    )
+                    post_party_change_events(party_changes)
+
+            if dashboard_file:
+                mode_dashboards[slot_mode].append({
+                    "file": dashboard_file,
+                    "start": format_slot_value(slot_start, slot_mode),
+                    "end": format_slot_value(slot_end, slot_mode),
+                    "party_focus": build_party_focus_for_messages(messages, meta_map),
+                })
+
     print("[done] Community detection completed.")
-    generate_timeline_dashboard(slot_type=slot_type)
+    generate_timeline_dashboard(
+        mode_dashboards=mode_dashboards,
+        topic_label=topic_label,
+    )
+    removed = clean_project_root()
+    if removed:
+        print(f"[cleanup] Rotated {len(removed)} generated artifacts from project root.")

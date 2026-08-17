@@ -1,0 +1,63 @@
+services:
+  api:
+    build: .
+    ports: ["8765:8765"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PARTY_CHANGE_API_HOST: "0.0.0.0"
+      PARTY_CHANGE_API_PORT: "8765"
+      PARTY_CHANGE_DB_PATH: /app/runtime_data/party_changes.sqlite3
+      ECHO_API_HOST: "0.0.0.0"
+      ECHO_API_PORT: "8765"
+      ECHO_API_DB_PATH: /app/runtime_data/echo_chamber.sqlite3
+      ELASTIC_AUTH: ${ELASTIC_AUTH:-1}
+      TOPIC_LABEL: ${TOPIC_LABEL:-}
+      TOPIC_QUERY: ${TOPIC_QUERY:-}
+      START_DATE: ${START_DATE:-}
+      END_DATE: ${END_DATE:-}
+      LOOKBACK_DAYS: ${LOOKBACK_DAYS:-14}
+      MAX_SCAN_DOCS: ${MAX_SCAN_DOCS:-0}
+    volumes:
+      - .:/app
+      - runtime_data:/app/runtime_data
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    restart: unless-stopped
+
+  pipeline:
+    build: .
+    profiles: [pipeline]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      MPLBACKEND: Agg
+      PARTY_CHANGE_API_URL: http://api:8765/api/v1/party-changes
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
+      ENABLE_LLM_NAMING: ${ENABLE_LLM_NAMING:-true}
+    volumes: [.:/app]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    depends_on: [api]
+    command: ["python", "-B", "community_detection.py"]
+
+  elastic:
+    build: .
+    profiles: [elastic]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      ELASTIC_AUTH: ${ELASTIC_AUTH:-1}
+      TOPIC_LABEL: ${TOPIC_LABEL:-}
+      TOPIC_QUERY: ${TOPIC_QUERY:-}
+      START_DATE: ${START_DATE:-}
+      END_DATE: ${END_DATE:-}
+      LOOKBACK_DAYS: ${LOOKBACK_DAYS:-14}
+      MAX_SCAN_DOCS: ${MAX_SCAN_DOCS:-0}
+    volumes: [.:/app]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    command: ["python", "-B", "elastic.py"]
+
+volumes:
+  runtime_data:
