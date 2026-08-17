@@ -3,7 +3,10 @@
 replicaCount: 1
 
 image:
-  repository: synappse.repo.stinascloud.ir/analytics-team/data-science-projects/echo-chamber-detection
+  # Path convention for this group is data-science-projects/<name> (no analytics-team
+  # prefix), matching ner, rag, ad-detection and the rest. This MUST stay identical to
+  # IMAGE_NAME in infra/ci-templates, or CI builds one path while Argo deploys another.
+  repository: synappse.repo.stinascloud.ir/data-science-projects/echo-chamber-detection
 
 imagePullSecrets:
 - name: nexus-access
