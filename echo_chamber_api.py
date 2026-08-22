@@ -52,6 +52,25 @@ STATIC_ALLOW = {
 }
 MEMBER_LIMIT = 500
 LOG_TAIL_LINES = 80
+PRELOADED_TOPICS = (
+    {"label": "جنگ جمهوری اسلامی و آمریکا", "query": "جنگ جمهوری اسلامی و آمریکا"},
+    {"label": "#همکاری_ملی", "query": "#همکاری_ملی"},
+    {"label": "#اعتراضات_سراسری", "query": "#اعتراضات_سراسری"},
+    {"label": "#معیشت", "query": "معیشت OR گرانی OR تورم"},
+    {"label": "#بازنشستگان", "query": "بازنشستگان OR حقوق_بازنشستگان"},
+    {"label": "#دانشجویان", "query": "دانشجو OR دانشجویان OR دانشگاه"},
+    {"label": "#انتخابات", "query": "انتخابات OR رای_گیری"},
+    {"label": "#تحریم", "query": "تحریم OR sanctions"},
+    {"label": "#مهاجرت", "query": "مهاجرت OR خروج_از_کشور"},
+    {"label": "#محیط_زیست", "query": "محیط زیست OR آلودگی هوا OR گرد و خاک"},
+    {"label": "#سلامت", "query": "سلامت OR بهداشت OR درمان"},
+)
+PROGRESS_STEPS = (
+    ("queued", "در صف"),
+    ("fetch", "دریافت از الستیک"),
+    ("detect", "تشخیص جوامع"),
+    ("ready", "آماده‌سازی داشبورد"),
+)
 
 PipelineExecutor = Callable[[Path, dict[str, Any], Path, str], dict[str, Any]]
 
@@ -129,6 +148,185 @@ def parse_iso_date(value: Any, field: str) -> str | None:
     except ValueError as exc:
         raise ValueError(f"{field} must be YYYY-MM-DD") from exc
     return text[:10]
+
+
+def topic_key(label: str) -> str:
+    clean = (label or "").strip()
+    if not clean:
+        return "__topic__"
+    key = re.sub(r"\s+", "_", clean)
+    key = re.sub(r"[^\w#آ-ی\u200c_-]+", "_", key, flags=re.UNICODE).strip("_")
+    return key or "__topic__"
+
+
+def parse_topic_labels(value: Any) -> list[str]:
+    if value in (None, ""):
+        return []
+    if isinstance(value, str):
+        return [item.strip() for item in re.split(r"[,،;]+", value) if item.strip()]
+    if not isinstance(value, list):
+        return []
+    labels = []
+    for item in value:
+        if isinstance(item, str) and item.strip():
+            labels.append(item.strip())
+        elif isinstance(item, dict):
+            label = str(item.get("label") or item.get("topic_label") or item.get("key") or "").strip()
+            if label:
+                labels.append(label)
+    return labels
+
+
+def preloaded_topic_map() -> dict[str, dict[str, str]]:
+    return {topic_key(item["label"]): dict(item) for item in PRELOADED_TOPICS}
+
+
+def resolve_topic_selection(payload: dict[str, Any]) -> list[dict[str, str]]:
+    items: list[dict[str, str]] = []
+    seen: set[str] = set()
+    raw_topics = payload.get("topics")
+    if isinstance(raw_topics, list):
+        source_items = raw_topics
+    else:
+        source_items = parse_topic_labels(
+            payload.get("topic_labels") or payload.get("topic_label")
+        )
+    presets = preloaded_topic_map()
+    for item in source_items:
+        if isinstance(item, dict):
+            label = str(item.get("label") or item.get("topic_label") or item.get("key") or "").strip()
+            query = str(item.get("query") or item.get("topic_query") or "").strip()
+        else:
+            label = str(item).strip()
+            query = ""
+        if not label:
+            continue
+        key = topic_key(label)
+        if key in seen:
+            continue
+        preset = presets.get(key)
+        items.append(
+            {
+                "key": key,
+                "label": str(preset["label"]) if preset else label,
+                "query": query or (str(preset["query"]) if preset else label),
+            }
+        )
+        seen.add(key)
+    return items
+
+
+def config_topic_keys(config: dict[str, Any]) -> set[str]:
+    keys: set[str] = set()
+    for item in config.get("topics") or []:
+        if isinstance(item, dict):
+            label = str(item.get("label") or item.get("key") or "").strip()
+            if label:
+                keys.add(topic_key(label))
+    for part in parse_topic_labels(config.get("topic_label")):
+        keys.add(topic_key(part))
+    keys.discard("__topic__")
+    return keys
+
+
+def topics_are_covered(requested: list[dict[str, str]], config: dict[str, Any]) -> bool:
+    wanted = {item["key"] for item in requested if item.get("key")}
+    if not wanted:
+        return True
+    return wanted <= config_topic_keys(config)
+
+
+def progress_payload(
+    status: str,
+    percent: int = 0,
+    stage: str = "",
+    message: str = "",
+) -> dict[str, Any]:
+    status = str(status or "queued")
+    if status == "queued":
+        percent, stage, message = 0, "queued", message or "در صف"
+    elif status == "done":
+        percent, stage, message = 100, "ready", message or "تکمیل شد"
+    elif status == "failed":
+        percent = max(0, min(100, int(percent)))
+        stage = stage or "fetch"
+        message = message or "خطا در اجرا"
+    else:
+        percent = max(0, min(100, int(percent)))
+        stage = stage or "fetch"
+        message = message or "در حال اجرا"
+    reached = False
+    steps = []
+    for step_id, label in PROGRESS_STEPS:
+        if status == "done":
+            state = "done"
+        elif step_id == stage:
+            state = "failed" if status == "failed" else ("done" if percent >= 100 else "running")
+            reached = True
+        elif not reached:
+            state = "done"
+        else:
+            state = "pending"
+        steps.append({"id": step_id, "label": label, "status": state})
+    return {
+        "percent": percent,
+        "remaining_percent": max(0, 100 - percent),
+        "stage": stage,
+        "message": message,
+        "steps": steps,
+    }
+
+
+def write_progress(log_file: Path, percent: int, stage: str, message: str) -> None:
+    path = Path(log_file).with_suffix(".progress.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "percent": percent,
+                "stage": stage,
+                "message": message,
+                "updated_at": utc_now(),
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def read_progress(log_path: str | Path | None, status: str, error: str = "") -> dict[str, Any]:
+    percent = 0
+    stage = "queued"
+    message = ""
+    if log_path:
+        progress_file = Path(log_path).with_suffix(".progress.json")
+        if progress_file.is_file():
+            try:
+                loaded = json.loads(progress_file.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    percent = int(loaded.get("percent") or 0)
+                    stage = str(loaded.get("stage") or stage)
+                    message = str(loaded.get("message") or "")
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                pass
+        log_file = Path(log_path)
+        if log_file.is_file() and status == "running":
+            try:
+                text = log_file.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                text = ""
+            if "community_detection.py" in text:
+                percent = max(percent, 60)
+                stage = "detect"
+                message = message or "در حال تشخیص جوامع"
+            elif "elastic.py" in text:
+                percent = max(percent, 15)
+                stage = "fetch"
+                message = message or "در حال دریافت از الستیک"
+    if status == "failed" and error:
+        message = error
+    return progress_payload(status, percent, stage, message)
 
 
 def format_slot_token(raw: str) -> str:
@@ -324,6 +522,7 @@ class PipelineStore:
             data["log_tail"] = lines[-log_tail:]
         else:
             data["log_tail"] = []
+        data["progress"] = read_progress(log_path, str(data.get("status") or ""), str(data.get("error") or ""))
         return data
 
     def list(self, limit: int, offset: int) -> tuple[int, list[dict[str, Any]]]:
@@ -804,6 +1003,13 @@ class ArtifactIndex:
         return items
 
     def list_dashboards(self, filters: dict[str, str], limit: int, offset: int) -> tuple[int, list[dict[str, Any]]]:
+        requested = parse_topic_labels(filters.get("topic"))
+        config = self.pipeline_config().get("config") or {}
+        if requested and not topics_are_covered(
+            [{"key": topic_key(label)} for label in requested],
+            config,
+        ):
+            return 0, []
         items = []
         for item in self.list_dashboards_raw():
             if filters.get("slot_mode") and item["slot_mode"] != filters["slot_mode"]:
@@ -850,15 +1056,21 @@ class ArtifactIndex:
     def list_topics(self) -> list[dict[str, Any]]:
         topics: dict[str, dict[str, Any]] = {}
 
-        def add(label: str, query: str = "", source: str = "", has_data: bool = False):
+        def add(
+            label: str,
+            query: str = "",
+            source: str = "",
+            has_data: bool = False,
+            preloaded: bool = False,
+        ):
             clean = (label or "").strip()
             if not clean:
                 return
-            key = re.sub(r"\s+", "_", clean)
-            key = re.sub(r"[^\w#آ-ی\u200c_-]+", "_", key, flags=re.UNICODE).strip("_") or "__topic__"
+            key = topic_key(clean)
             current = topics.get(key)
             if current:
                 current["has_data"] = current["has_data"] or has_data
+                current["preloaded"] = current["preloaded"] or preloaded
                 if query and not current.get("query"):
                     current["query"] = query
                 if source and source not in current["sources"]:
@@ -869,12 +1081,25 @@ class ArtifactIndex:
                 "label": clean,
                 "query": (query or clean).strip(),
                 "has_data": has_data,
+                "preloaded": preloaded,
                 "sources": [source] if source else [],
             }
 
+        for item in PRELOADED_TOPICS:
+            add(item["label"], item["query"], source="preload", preloaded=True)
+
         config = self.pipeline_config().get("config") or {}
+        config_has_data = bool(self.list_dashboards_raw())
         if config.get("topic_label"):
-            add(str(config["topic_label"]), source="pipeline_config", has_data=True)
+            add(str(config["topic_label"]), source="pipeline_config", has_data=config_has_data)
+        for item in config.get("topics") or []:
+            if isinstance(item, dict):
+                add(
+                    str(item.get("label") or ""),
+                    str(item.get("query") or ""),
+                    source="pipeline_config",
+                    has_data=config_has_data,
+                )
 
         csv_path = self.root / "topics_10.csv"
         if csv_path.exists():
@@ -976,11 +1201,23 @@ def validate_pipeline_payload(payload: Any) -> dict[str, Any]:
             raise ValueError("days must be >= 1")
     else:
         days = None
+    explicit_multi = bool(parse_topic_labels(payload.get("topic_labels"))) or (
+        isinstance(payload.get("topics"), list) and bool(payload.get("topics"))
+    )
+    selected = resolve_topic_selection(payload) if explicit_multi else []
+    topic_label = str(payload.get("topic_label") or "").strip()
+    topic_query = str(payload.get("topic_query") or "").strip()
+    if selected:
+        topic_label = topic_label or "، ".join(item["label"] for item in selected)
+        topic_query = topic_query or " OR ".join(
+            item["query"] for item in selected if item.get("query")
+        )
     return {
         "fetch": fetch,
         "detect": detect,
-        "topic_label": str(payload.get("topic_label") or "").strip(),
-        "topic_query": str(payload.get("topic_query") or "").strip(),
+        "topic_label": topic_label,
+        "topic_query": topic_query,
+        "topics": selected,
         "start_date": parse_iso_date(payload.get("start_date"), "start_date"),
         "end_date": parse_iso_date(payload.get("end_date"), "end_date"),
         "days": days,
@@ -1094,7 +1331,9 @@ def execute_pipeline(
                 f"command failed ({process.returncode}): {' '.join(command)}"
             )
 
+    write_progress(log_file, 5, "queued", "شروع اجرا")
     if params.get("fetch", True):
+        write_progress(log_file, 15, "fetch", "در حال دریافت از الستیک")
         command = [python_bin, "-B", "elastic.py"]
         auth = params.get("auth") or os.getenv("ELASTIC_AUTH") or "1"
         command.extend(["--auth", str(auth)])
@@ -1113,6 +1352,7 @@ def execute_pipeline(
         if params.get("max_scan_docs"):
             command.extend(["--max-scan-docs", str(params["max_scan_docs"])])
         run_cmd(command)
+        write_progress(log_file, 50, "fetch", "دریافت الستیک تمام شد")
 
     config_path = root / "pipeline_config.json"
     config: dict[str, Any] = {}
@@ -1128,6 +1368,9 @@ def execute_pipeline(
         if params.get(key):
             config[key] = params[key]
             changed = True
+    if params.get("topics"):
+        config["topics"] = params["topics"]
+        changed = True
     if params.get("slot_modes"):
         config["slot_modes"] = params["slot_modes"]
         changed = True
@@ -1138,8 +1381,10 @@ def execute_pipeline(
     if params.get("detect", True):
         if not (root / "interactions.json").exists():
             raise RuntimeError("interactions.json is missing; run fetch first or set fetch=true")
+        write_progress(log_file, 60, "detect", "در حال تشخیص جوامع")
         run_cmd([python_bin, "-B", "community_detection.py"])
 
+    write_progress(log_file, 100, "ready", "تکمیل شد")
     after_reports = snapshot_names(communities, "hybrid_report_*.json") if communities.is_dir() else set()
     after_dashboards = snapshot_names(root, "dashboard_*.html")
     return {
@@ -1205,12 +1450,32 @@ class PipelineRunRequest(BaseModel):
     detect: bool = True
     topic_label: str = ""
     topic_query: str = ""
+    topic_labels: list[str] | None = None
+    topics: Any = None
     start_date: str | None = None
     end_date: str | None = None
     days: int | None = None
     slot_modes: Any = None
     auth: str = ""
     include_secondary: bool = False
+    max_scan_docs: int = 0
+
+
+class SearchRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    topics: Any = None
+    topic_labels: list[str] | None = None
+    topic_label: str = ""
+    topic_query: str = ""
+    start: str | None = None
+    start_date: str | None = None
+    end: str | None = None
+    end_date: str | None = None
+    slot_mode: str = ""
+    slot_modes: Any = None
+    fetch: bool = True
+    detect: bool = True
+    auth: str = ""
     max_scan_docs: int = 0
 
 
@@ -1296,6 +1561,26 @@ def create_app(
 
     def query_limit_offset(limit: str, offset: str) -> tuple[int, int]:
         return parse_limit_offset({"limit": [str(limit)], "offset": [str(offset)]})
+
+    def start_pipeline_run(params: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        with pipeline_lock:
+            if pipeline_store.has_active():
+                return 409, {"error": "a pipeline run is already queued or running"}
+            log_dir.mkdir(parents=True, exist_ok=True)
+            run = pipeline_store.create(params)
+        if pipeline_sync:
+            run_pipeline_job(run["run_id"])
+        else:
+            thread = threading.Thread(
+                target=run_pipeline_job,
+                args=(run["run_id"],),
+                name=f"pipeline-{run['run_id'][:8]}",
+                daemon=True,
+            )
+            thread.start()
+        started = pipeline_store.get(run["run_id"])
+        assert started is not None
+        return 202, started
 
     @app.middleware("http")
     async def auth_middleware(request: Request, call_next):
@@ -1407,22 +1692,10 @@ def create_app(
     @app.post("/api/v1/pipeline/runs", status_code=202, tags=["pipeline"])
     def post_pipeline_run(payload: PipelineRunRequest | None = None):
         params = validate_pipeline_payload(payload.model_dump() if payload else {})
-        with pipeline_lock:
-            if pipeline_store.has_active():
-                return error_json(409, "a pipeline run is already queued or running")
-            log_dir.mkdir(parents=True, exist_ok=True)
-            run = pipeline_store.create(params)
-        if pipeline_sync:
-            run_pipeline_job(run["run_id"])
-        else:
-            thread = threading.Thread(
-                target=run_pipeline_job,
-                args=(run["run_id"],),
-                name=f"pipeline-{run['run_id'][:8]}",
-                daemon=True,
-            )
-            thread.start()
-        return pipeline_store.get(run["run_id"])
+        status, body = start_pipeline_run(params)
+        if status == 409:
+            return error_json(409, body["error"])
+        return UTF8JSONResponse(status_code=202, content=body)
 
     @app.get("/api/v1/reports", tags=["reports"])
     def list_reports(
@@ -1463,10 +1736,11 @@ def create_app(
         slot_mode: str = "",
         start: str = "",
         end: str = "",
+        topic: str = "",
     ):
         limit_n, offset_n = query_limit_offset(limit, offset)
         total, dashboards = artifacts.list_dashboards(
-            {"slot_mode": slot_mode, "start": start, "end": end},
+            {"slot_mode": slot_mode, "start": start, "end": end, "topic": topic},
             limit_n,
             offset_n,
         )
@@ -1483,7 +1757,65 @@ def create_app(
 
     @app.get("/api/v1/topics", tags=["dashboards"])
     def list_topics():
-        return {"topics": artifacts.list_topics()}
+        return {
+            "selection": "multiple",
+            "topics": artifacts.list_topics(),
+        }
+
+    @app.post("/api/v1/search", tags=["dashboards"])
+    def search_dashboards(payload: SearchRequest | None = None):
+        raw = payload.model_dump() if payload else {}
+        if raw.get("start") and not raw.get("start_date"):
+            raw["start_date"] = raw["start"]
+        if raw.get("end") and not raw.get("end_date"):
+            raw["end_date"] = raw["end"]
+        if raw.get("slot_mode") and not raw.get("slot_modes"):
+            raw["slot_modes"] = raw["slot_mode"]
+        params = validate_pipeline_payload(raw)
+        start = params.get("start_date") or ""
+        end = params.get("end_date") or ""
+        slot_mode = ""
+        if params.get("slot_modes"):
+            slot_mode = params["slot_modes"][0]
+        selected = params.get("topics") or []
+        config = artifacts.pipeline_config().get("config") or {}
+        total, dashboards = artifacts.list_dashboards(
+            {
+                "slot_mode": slot_mode,
+                "start": start,
+                "end": end,
+                "topic": "، ".join(item["label"] for item in selected),
+            },
+            500,
+            0,
+        )
+        cached = bool(dashboards) and topics_are_covered(selected, config)
+        if cached:
+            return {
+                "status": "ready",
+                "cached": True,
+                "run_id": None,
+                "topics": selected,
+                "progress": progress_payload("done"),
+                "dashboards": dashboards,
+                "total": total,
+            }
+        status, body = start_pipeline_run(params)
+        if status == 409:
+            return error_json(409, body["error"])
+        return UTF8JSONResponse(
+            status_code=202,
+            content={
+                "status": body.get("status") or "queued",
+                "cached": False,
+                "run_id": body.get("run_id"),
+                "topics": selected,
+                "progress": body.get("progress") or progress_payload(str(body.get("status") or "queued")),
+                "dashboards": [],
+                "total": 0,
+                "run": body,
+            },
+        )
 
     @app.get("/api/v1/files/{filename}", tags=["dashboards"])
     def get_file(filename: str):
