@@ -67,6 +67,13 @@ env:
 # elastic_client.py - see the README note about moving them to ESO/Vault.
 - name: ELASTIC_AUTH
   value: '1'
+# Without this, community_detection.py logs
+#   "[party-change] Detected N transition(s); API is not configured, so they were not persisted."
+# and throws the results away. docker-compose sets it to http://api:8765/...; the
+# in-cluster equivalent is this app's own Service, so the detections land in
+# party_changes.sqlite3 on the PVC via POST /api/v1/party-changes.
+- name: PARTY_CHANGE_API_URL
+  value: 'http://echo-chamber-detection-template:8765/api/v1/party-changes'
 
 # Persistent storage for runtime_data. The `template` chart has no PVC template of its own,
 # so the claim is created separately (paas: manifest/synappse-data-science/
@@ -79,6 +86,17 @@ volumes:
 volumeMounts:
 - name: runtime-data
   mountPath: /app/runtime_data
+# Pipeline reports persist on the PVC instead of the container's ephemeral layer.
+# community_detection.py writes them to a HARDCODED relative "communities/" (see
+# save_hybrid_report(output_dir="communities") and the os.makedirs("communities") call),
+# i.e. into the working directory /app - which is destroyed every time the pod is
+# replaced. Three deploys on 2026-08-22 (1.0.8 -> 1.0.9 -> 1.0.10) each wiped every
+# report and dashboard, and the only reason they were recoverable was a manual copy.
+# subPath "communities" is the same directory as /app/runtime_data/communities, so the
+# reports are also reachable through the existing mount.
+- name: runtime-data
+  mountPath: /app/communities
+  subPath: communities
 
 ingress:
   enabled: true
