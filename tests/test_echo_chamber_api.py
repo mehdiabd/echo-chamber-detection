@@ -223,6 +223,8 @@ class PipelineStoreTests(unittest.TestCase):
         done = self.store.get(run["run_id"])
         self.assertEqual(done["status"], "done")
         self.assertEqual(done["reports"], ["a.json"])
+        self.assertEqual(done["progress"]["percent"], 100)
+        self.assertEqual(done["progress"]["remaining_percent"], 0)
         self.assertFalse(self.store.has_active())
 
     def test_validation_requires_work(self):
@@ -328,6 +330,11 @@ class ExecutePipelineTests(unittest.TestCase):
             )
             self.assertEqual(config["slot_modes"], ["daily"])
             self.assertEqual(config["topic_label"], "جنگ")
+            progress = json.loads(
+                (root / "run.progress.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(progress["percent"], 100)
+            self.assertEqual(progress["stage"], "ready")
 
 
 class ApiServerTests(unittest.TestCase):
@@ -455,9 +462,14 @@ class ApiServerTests(unittest.TestCase):
         self.assertEqual(slot["graph"]["node_count"], 3)
         self.assertEqual(slot["graph"]["edges"][0]["from"], "alice")
         topics = self.request("GET", "/api/v1/topics")
+        self.assertEqual(topics["selection"], "multiple")
         labels = {item["label"] for item in topics["topics"]}
         self.assertIn("جنگ", labels)
         self.assertIn("انتخابات", labels)
+        self.assertIn("#تحریم", labels)
+        self.assertIn("جنگ جمهوری اسلامی و آمریکا", labels)
+        preloaded = [item for item in topics["topics"] if item.get("preloaded")]
+        self.assertGreaterEqual(len(preloaded), 10)
         downloaded = self.request(
             "GET", "/api/v1/files/dashboard_daily_260101_to_260102.html"
         )
@@ -582,6 +594,61 @@ class ApiServerTests(unittest.TestCase):
             "GET", "/api/v1/reports/does-not-exist", status=404
         )
         self.assertEqual(unknown_report["error"], "not found")
+
+    def test_multi_topic_payload_joins_queries(self):
+        params = validate_pipeline_payload(
+            {
+                "fetch": False,
+                "detect": True,
+                "topic_labels": ["#تحریم", "#معیشت"],
+            }
+        )
+        self.assertEqual(params["topic_label"], "#تحریم، #معیشت")
+        self.assertIn("تحریم OR sanctions", params["topic_query"])
+        self.assertIn("معیشت OR گرانی OR تورم", params["topic_query"])
+        self.assertEqual([item["key"] for item in params["topics"]], ["#تحریم", "#معیشت"])
+
+    def test_search_returns_cached_dashboards_or_starts_pipeline(self):
+        cached = self.request(
+            "POST",
+            "/api/v1/search",
+            {
+                "topics": ["جنگ"],
+                "start": "2026-01-01",
+                "end": "2026-01-02",
+                "slot_mode": "daily",
+            },
+        )
+        self.assertEqual(cached["status"], "ready")
+        self.assertTrue(cached["cached"])
+        self.assertEqual(cached["dashboards"][0]["id"], "daily_260101_to_260102")
+        self.assertEqual(cached["progress"]["percent"], 100)
+        self.assertEqual(self.executor_calls, [])
+
+        missing = self.request(
+            "POST",
+            "/api/v1/search",
+            {
+                "topic_labels": ["#تحریم", "#انتخابات"],
+                "start_date": "2026-08-21",
+                "end_date": "2026-08-22",
+                "fetch": False,
+                "detect": True,
+            },
+            status=202,
+        )
+        self.assertFalse(missing["cached"])
+        self.assertTrue(missing["run_id"])
+        self.assertEqual(len(self.executor_calls), 1)
+        self.assertEqual(
+            self.executor_calls[0]["topic_label"],
+            "#تحریم، #انتخابات",
+        )
+        detail = self.request("GET", f"/api/v1/pipeline/runs/{missing['run_id']}")
+        self.assertEqual(detail["status"], "done")
+        self.assertIn("percent", detail["progress"])
+        self.assertIn("remaining_percent", detail["progress"])
+        self.assertEqual(len(detail["progress"]["steps"]), 4)
 
 
 if __name__ == "__main__":
