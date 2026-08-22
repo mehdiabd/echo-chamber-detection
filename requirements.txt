@@ -12,7 +12,10 @@ matplotlib==3.8.0
 pyvis==0.3.2
 
 # Search & retrieval
-elasticsearch
+# Must stay on 8.x: the server rejects the v9 compatibility header with
+# media_type_header_exception "Accept version must be either version 8 or 7,
+# but found 9". Unpinned, pip installed 9.5.0 and every call 400d.
+elasticsearch>=8.0,<9.0
 ollama
 requests
 python-dateutil
