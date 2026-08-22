@@ -220,9 +220,11 @@ auth_type = args.auth
 if auth_type == "1":
     # API Key Authentication
     # print("You selected Production Elasticsearch server (API Key Authentication).")
-    cur_path = os.path.dirname(__file__)
-    CERTIFICATE = os.path.join(cur_path, "ca.crt")
-    ELASTICSEARCH_URL = "https://192.168.59.79:9200"
+    # Public hostname behind Kong with a publicly trusted certificate, so no local
+    # CA file is needed. Previously https://192.168.59.79:9200 with ca_certs=./ca.crt,
+    # which .gitignore excludes - so the file was never in the image and every run
+    # died with "TlsError: SSLError([Errno 2] No such file or directory)".
+    ELASTICSEARCH_URL = "https://elastic.synappse.ir"
     AUTH = "YXYyeVRKWUJKSFpwMVdrTnZWRDc6UHhqRHBQa2ZUYW1yMnBwWTV3Ri0xUQ=="
     INDEX = "twitter_temp_data"
 
@@ -230,7 +232,6 @@ if auth_type == "1":
     es = Elasticsearch(
         ELASTICSEARCH_URL,
         api_key=AUTH,
-        ca_certs=CERTIFICATE,
         verify_certs=True,
         ssl_show_warn=False
     )
