@@ -9,8 +9,11 @@ from echo_chamber_api import (
     ArtifactIndex,
     PipelineStore,
     ReviewStore,
+    command_failure_message,
     create_app,
     execute_pipeline,
+    infer_live_progress,
+    read_progress,
     validate_pipeline_payload,
 )
 from party_change_api import PartyChangeStore
@@ -226,6 +229,72 @@ class PipelineStoreTests(unittest.TestCase):
         self.assertEqual(done["progress"]["percent"], 100)
         self.assertEqual(done["progress"]["remaining_percent"], 0)
         self.assertFalse(self.store.has_active())
+
+
+class PipelineProgressTests(unittest.TestCase):
+    def test_infer_live_progress_from_detect_slots(self):
+        log_text = (
+            "$ python -B elastic.py --auth 1\n"
+            "Starting initial scan query...\n"
+            "[scan-progress] initial_scan docs=400\n"
+            "Finished full pipeline.\n"
+            "$ python -B community_detection.py\n"
+            "[slot 5/14 | daily] Processing: 2026-01-05 to 2026-01-05...\n"
+        )
+        percent, stage, message = infer_live_progress(log_text)
+        self.assertEqual(stage, "detect")
+        self.assertEqual(percent, 72)
+        self.assertIn("5", message)
+        self.assertIn("14", message)
+        self.assertIn("daily", message)
+
+    def test_read_progress_uses_slot_status_while_running(self):
+        with tempfile.TemporaryDirectory() as raw:
+            log_file = Path(raw) / "run.log"
+            log_file.write_text(
+                "$ python -B community_detection.py\n"
+                "[slot 2/4 | daily] Processing: 2026-08-21 to 2026-08-21...\n",
+                encoding="utf-8",
+            )
+            progress = read_progress(log_file, "running")
+            self.assertEqual(progress["stage"], "detect")
+            self.assertEqual(progress["percent"], 77)
+            self.assertEqual(progress["steps"][2]["status"], "running")
+            self.assertIn("اسلات 2 از 4", progress["message"])
+
+    def test_command_failure_includes_traceback_line(self):
+        with tempfile.TemporaryDirectory() as raw:
+            log_file = Path(raw) / "run.log"
+            log_file.write_text(
+                "$ python -B community_detection.py\n"
+                "Traceback (most recent call last):\n"
+                "FileNotFoundError: [Errno 2] No such file or directory: "
+                "'timeline_template.html'\n",
+                encoding="utf-8",
+            )
+            message = command_failure_message(
+                log_file, ["python", "-B", "community_detection.py"], 1
+            )
+            self.assertIn("timeline_template.html", message)
+            self.assertIn("FileNotFoundError", message)
+
+    def test_failed_detect_script_surfaces_error_line(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            (root / "interactions.json").write_text("[]", encoding="utf-8")
+            (root / "community_detection.py").write_text(
+                "print(\"FileNotFoundError: missing timeline_template.html\")\n"
+                "raise SystemExit(1)\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(RuntimeError) as raised:
+                execute_pipeline(
+                    root,
+                    {"fetch": False, "detect": True},
+                    root / "run.log",
+                    "python3",
+                )
+            self.assertIn("timeline_template.html", str(raised.exception))
 
     def test_validation_requires_work(self):
         with self.assertRaises(ValueError):

@@ -469,6 +469,8 @@ with open("res.json", "w", encoding="utf-8") as f:
         json.dump(source, f, ensure_ascii=False)
         f.write("\n")
         COUNT += 1
+        if COUNT == 1 or COUNT % 200 == 0:
+            log.info(f"[scan-progress] initial_scan docs={COUNT}")
         uname = normalize_user_handle(source.get("user_name"))
         if uname:
             usernames.add(uname)
@@ -495,6 +497,8 @@ with open("interactions.json", "w", encoding="utf-8") as f_interactions:
     EXAMPLE_PRINTED = 0
     for doc in interaction_scan:
         scanned_docs += 1
+        if scanned_docs == 1 or scanned_docs % 200 == 0:
+            log.info(f"[scan-progress] interaction_scan docs={scanned_docs}")
         if args.max_scan_docs and scanned_docs > args.max_scan_docs:
             log.info(f"Reached --max-scan-docs={args.max_scan_docs} in interaction scan.")
             break
