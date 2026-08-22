@@ -139,6 +139,18 @@ def format_slot_token(raw: str) -> str:
     return dt.strftime("%Y-%m-%d")
 
 
+def load_party_focus(payload: dict[str, Any]) -> dict[str, Any]:
+    party_focus = payload.get("partyFocus")
+    if party_focus is None:
+        party_focus = payload.get("party_focus")
+    if not isinstance(party_focus, dict):
+        return {"parties": []}
+    parties = party_focus.get("parties")
+    if not isinstance(parties, list):
+        return {"parties": []}
+    return {"parties": [item for item in parties if isinstance(item, dict)]}
+
+
 def load_graph_json(path: Path | None) -> dict[str, Any]:
     """Read the nodes/edges written by the pipeline next to the hybrid graph."""
     payload: Any = None
@@ -156,6 +168,7 @@ def load_graph_json(path: Path | None) -> dict[str, Any]:
         "edges": edges,
         "node_count": len(nodes),
         "edge_count": len(edges),
+        "partyFocus": load_party_focus(payload),
     }
 
 
@@ -812,9 +825,11 @@ class ArtifactIndex:
             if item["id"] == wanted or item["dashboard"] == wanted:
                 payload = dict(item)
                 graph_name = item.get("graph_json")
-                payload["graph"] = load_graph_json(
+                graph = load_graph_json(
                     self.root / graph_name if graph_name else None
                 )
+                payload["partyFocus"] = graph.pop("partyFocus")
+                payload["graph"] = graph
                 payload["files"] = {
                     "dashboard": f"/api/v1/files/{item['dashboard']}",
                     "legend": f"/api/v1/files/{item['legend']}" if item.get("legend") else None,

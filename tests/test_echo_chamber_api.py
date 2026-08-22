@@ -89,6 +89,22 @@ def write_dashboard(root: Path):
                     {"from": "alice", "to": "bob", "weight": 2},
                     {"from": "bob", "to": "carol", "weight": 1},
                 ],
+                "partyFocus": {
+                    "parties": [
+                        {
+                            "name": "جریان زن‌زندگی‌آزادی",
+                            "stats": {"total": 438, "outgoing": 209, "incoming": 229},
+                            "top_interactions": [
+                                {
+                                    "type": "نقل‌قول",
+                                    "handle": "@CENTCOM",
+                                    "count": 15,
+                                },
+                                {"type": "ذکر", "handle": "@PMN_Amy", "count": 10},
+                            ],
+                        }
+                    ]
+                },
             }
         ),
         encoding="utf-8",
@@ -157,6 +173,16 @@ class ArtifactIndexTests(unittest.TestCase):
         self.assertEqual(detail["graph"]["edge_count"], 2)
         self.assertEqual(detail["graph"]["nodes"][0]["id"], "alice")
         self.assertEqual(detail["graph"]["edges"][0]["from"], "alice")
+        self.assertNotIn("partyFocus", detail["graph"])
+        self.assertEqual(
+            detail["partyFocus"]["parties"][0]["name"],
+            "جریان زن‌زندگی‌آزادی",
+        )
+        self.assertEqual(detail["partyFocus"]["parties"][0]["stats"]["total"], 438)
+        self.assertEqual(
+            detail["partyFocus"]["parties"][0]["top_interactions"][0]["handle"],
+            "@CENTCOM",
+        )
         self.assertEqual(
             detail["files"]["graph"],
             "/api/v1/files/hybrid_graph_daily_260101_to_260102.json",
@@ -167,6 +193,7 @@ class ArtifactIndexTests(unittest.TestCase):
         detail = self.index.get_dashboard("daily_260101_to_260102")
         self.assertEqual(detail["graph"]["nodes"], [])
         self.assertEqual(detail["graph"]["edge_count"], 0)
+        self.assertEqual(detail["partyFocus"], {"parties": []})
         self.assertIsNone(detail["files"]["graph"])
 
     def test_rejects_path_traversal_for_files(self):
