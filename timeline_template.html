@@ -1,0 +1,729 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>پنل تحلیل جوامع شبکه اجتماعی ایکس | {topic_label}</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        html, body {
+            height: 100%;
+            overflow: hidden;
+        }
+
+        body {
+            font-family: 'Vazirmatn', Tahoma, Arial, sans-serif;
+            background: #eef2f6;
+            height: 100vh;
+            padding: 12px;
+        }
+        
+        .container {
+            width: 100%;
+            height: calc(100vh - 24px);
+            margin: 0 auto;
+            background: white;
+            border: 1px solid #d8dee8;
+            border-radius: 8px;
+            box-shadow: 0 10px 28px rgba(21, 39, 59, 0.16);
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #2c3e50 0%, #34495e 100%);
+            color: white;
+            padding: 12px 18px;
+            text-align: center;
+            flex: 0 0 auto;
+        }
+        
+        .header h1 {
+            font-size: 22px;
+            margin-bottom: 4px;
+        }
+        
+        .header p {
+            opacity: 0.9;
+            font-size: 13px;
+            margin-top: 4px;
+        }
+        
+        .controls {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            align-items: center;
+            gap: 12px;
+            padding: 10px 18px;
+            background: #f8f9fa;
+            border-bottom: 1px solid #dee2e6;
+            flex: 0 0 auto;
+        }
+        
+        .timeline-info {
+            font-size: 15px;
+            color: #495057;
+            font-weight: 600;
+            text-align: right;
+        }
+        
+        .mode-select {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            justify-content: flex-end;
+        }
+        
+        .mode-select select,
+        .topic-select select,
+        .party-select select {
+            padding: 8px 10px;
+            border-radius: 8px;
+            border: 1px solid #ced4da;
+            font-family: inherit;
+            min-width: 180px;
+        }
+
+        .topic-select,
+        .party-select {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            justify-content: flex-end;
+        }
+        
+        .topic-banner {
+            text-align: center;
+            margin: 8px 0 10px;
+            font-weight: 700;
+            color: #2c3e50;
+            font-size: 18px;
+        }
+        
+        .nav-buttons {
+            display: flex;
+            justify-content: center;
+            gap: 10px;
+            width: 100%;
+            padding-top: 8px;
+            flex: 0 0 auto;
+        }
+        
+        .nav-buttons button {
+            padding: 10px 24px;
+            border: none;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            font-family: inherit;
+        }
+        
+        .nav-buttons button:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+        }
+        
+        .nav-buttons button:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
+        
+        .btn-prev {
+            background: #6c757d;
+            color: white;
+        }
+        
+        .btn-next {
+            background: #007bff;
+            color: white;
+        }
+        
+        .content {
+            padding: 0 12px 12px;
+            flex: 1 1 auto;
+            min-height: 0;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .graph-container {
+            display: none;
+        }
+        
+        .graph-container.active {
+            display: block;
+            animation: fadeIn 0.4s ease;
+        }
+
+        .legend {
+            background: #f8f9fa;
+            border-radius: 6px;
+            padding: 12px;
+            box-shadow: none;
+            border: 1px solid #e3e7ed;
+        }
+
+        .legend-row {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            margin-top: 0;
+        }
+
+        .legend-item {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 8px;
+            margin: 4px 0;
+            font-size: 14px;
+            color: #343a40;
+        }
+
+        .legend-item .color-box {
+            width: 16px;
+            height: 16px;
+            border-radius: 4px;
+            border: 1px solid rgba(0,0,0,0.15);
+            display: inline-block;
+        }
+
+        .legend-item .count {
+            color: #6c757d;
+            font-size: 12px;
+        }
+
+        .legend-item .meta {
+            display: block;
+            flex-basis: 100%;
+            font-size: 12px;
+            color: #6c757d;
+            margin-right: 24px;
+        }
+        
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+        
+        iframe {
+            width: 100%;
+            height: 100%;
+            border: 1px solid #dee2e6;
+            border-radius: 6px;
+            background: white;
+        }
+        
+        .progress-bar {
+            height: 4px;
+            background: #e9ecef;
+            margin-top: 0;
+            flex: 0 0 auto;
+        }
+        
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+            transition: width 0.3s ease;
+        }
+
+        .graph-panel {
+            flex: 1 1 auto;
+            min-height: 0;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .workspace {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) 360px;
+            gap: 12px;
+            flex: 1 1 auto;
+            height: 100%;
+            min-height: 0;
+        }
+
+        .viewer {
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+            min-height: 0;
+            height: 100%;
+        }
+
+        .viewer iframe {
+            flex: 1 1 auto;
+            min-height: 0;
+            height: 100%;
+        }
+
+        .empty-state {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 84px;
+            border: 1px solid #dfe5ec;
+            border-radius: 6px;
+            background: #f8fafc;
+            color: #5d6878;
+            font-weight: 600;
+        }
+
+        .empty-state[hidden] {
+            display: none;
+        }
+
+        .legend-panel {
+            min-width: 0;
+            min-height: 0;
+            overflow: auto;
+            padding-left: 2px;
+        }
+
+        .legend[hidden] {
+            display: none;
+        }
+
+        .party-focus {
+            background: #ffffff;
+            border: 1px solid #dfe5ec;
+            border-radius: 6px;
+            padding: 12px;
+            margin-bottom: 12px;
+        }
+
+        .party-focus h3 {
+            font-size: 15px;
+            margin-bottom: 8px;
+            color: #243447;
+        }
+
+        .party-metrics {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 8px;
+            margin-bottom: 10px;
+        }
+
+        .metric {
+            background: #f6f8fb;
+            border: 1px solid #e2e7ee;
+            border-radius: 6px;
+            padding: 8px;
+        }
+
+        .metric span {
+            display: block;
+            color: #6b7280;
+            font-size: 11px;
+            margin-bottom: 3px;
+        }
+
+        .metric strong {
+            font-size: 16px;
+            color: #26384d;
+        }
+
+        .topic-list {
+            display: flex;
+            flex-direction: column;
+            gap: 7px;
+            margin-top: 8px;
+        }
+
+        .topic-row {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) 42px;
+            gap: 8px;
+            align-items: center;
+            font-size: 12px;
+            color: #374151;
+        }
+
+        .topic-label {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            direction: ltr;
+            text-align: right;
+        }
+
+        .topic-bar {
+            grid-column: 1 / -1;
+            height: 5px;
+            border-radius: 999px;
+            background: #e5e7eb;
+            overflow: hidden;
+        }
+
+        .topic-bar span {
+            display: block;
+            height: 100%;
+            background: #3b82f6;
+        }
+
+        .party-timeline {
+            display: flex;
+            align-items: end;
+            gap: 4px;
+            min-height: 48px;
+            margin-top: 10px;
+            padding-top: 6px;
+            border-top: 1px solid #edf0f4;
+        }
+
+        .party-timeline button {
+            flex: 1 1 0;
+            min-width: 8px;
+            border: 0;
+            border-radius: 4px 4px 0 0;
+            background: #cbd5e1;
+            cursor: pointer;
+        }
+
+        .party-timeline button.active {
+            background: #2563eb;
+        }
+
+        @media (max-width: 1100px) {
+            .workspace {
+                grid-template-columns: 1fr;
+                grid-template-rows: minmax(0, 1fr) auto;
+            }
+            .legend-panel {
+                max-height: 220px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>📊 پنل تحلیل جوامع شبکه اجتماعی ایکس</h1>
+            <p>
+                حالت نمایش: <strong id="slotMode">---</strong>
+                &nbsp;|&nbsp;
+                بازه فعال: <strong id="slotRange">---</strong>
+            </p>
+        </div>
+        
+        <div class="controls">
+            <div class="timeline-info">
+                <span id="currentSlot">بازه 1</span> از <span id="totalSlots">{total_slots}</span>
+            </div>
+            <div class="mode-select">
+                <label for="modeSelect">انتخاب حالت نمایش:</label>
+                <select id="modeSelect"></select>
+            </div>
+            <div class="topic-select">
+                <label for="topicSelect">انتخاب موضوع:</label>
+                <select id="topicSelect"></select>
+            </div>
+            <div class="party-select">
+                <label for="partySelect">نمای حزب:</label>
+                <select id="partySelect"></select>
+            </div>
+        </div>
+        
+        <div class="progress-bar">
+            <div class="progress-fill" id="progressBar"></div>
+        </div>
+        
+        <div class="content">
+            <div class="topic-banner" id="topicBanner">موضوع: {topic_label}</div>
+            <div class="graph-panel">
+                <div class="workspace">
+                    <div class="viewer">
+                        <iframe id="timelineFrame" src="" title="timeline graph"></iframe>
+                        <div class="empty-state" id="emptyTopicState" hidden>برای این موضوع هنوز خروجی ساخته نشده</div>
+                        <div class="nav-buttons">
+                            <button id="prevBtn" class="btn-prev" onclick="navigate(-1)">▶ قبلی</button>
+                            <button id="nextBtn" class="btn-next" onclick="navigate(1)">بعدی ◀</button>
+                        </div>
+                    </div>
+                    <aside class="legend-panel">
+                        <section class="party-focus" id="partyFocusPanel">
+                            <h3 id="partyFocusTitle">نمای حزب</h3>
+                            <div class="party-metrics">
+                                <div class="metric"><span>کل تعامل</span><strong id="partyTotal">0</strong></div>
+                                <div class="metric"><span>خروجی</span><strong id="partyOutgoing">0</strong></div>
+                                <div class="metric"><span>ورودی</span><strong id="partyIncoming">0</strong></div>
+                            </div>
+                            <div class="topic-list" id="partyTopics"></div>
+                            <div class="party-timeline" id="partyTimeline"></div>
+                        </section>
+                        <div class="legend-row">
+                            <div class="legend" id="hybridLegendBox">
+                                <strong id="hybridLegendTitle">روش ترکیبی</strong>
+                                <div id="hybridLegend"></div>
+                            </div>
+                        </div>
+                    </aside>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        const timelineModes = {timeline_modes};
+        const timelineTopics = {timeline_topics};
+        const topicOptions = {topic_options};
+        const defaultTopic = {default_topic};
+        const defaultMode = {default_mode};
+        let currentTopic = timelineTopics[defaultTopic] ? defaultTopic : Object.keys(timelineTopics)[0];
+        let currentMode = '';
+        let currentIndex = 0;
+        let currentParty = '';
+
+        const metaLabels = {
+            political_label: "گرایش سیاسی",
+            category: "موضوع",
+            emotion: "احساس",
+            sentiment: "حس",
+            language: "زبان"
+        };
+
+        function formatMeta(meta) {
+            if (!meta) return '';
+            const parts = [];
+            if (meta.stance) {
+                if (typeof meta.stance === 'object') {
+                    const target = meta.stance.target;
+                    const stance = meta.stance.stance;
+                    if (stance) {
+                        parts.push(target ? `موضع نسبت به ${target}: ${stance}` : `موضع: ${stance}`);
+                    }
+                } else {
+                    parts.push(`موضع: ${meta.stance}`);
+                }
+            }
+            for (const [key, label] of Object.entries(metaLabels)) {
+                if (meta[key]) parts.push(`${label}: ${meta[key]}`);
+            }
+            return parts.join(' | ');
+        }
+
+        function buildLegend(groups) {
+            if (!groups || Object.keys(groups).length === 0) {
+                return '<div class="legend-item"><span class="label">بدون داده</span></div>';
+            }
+            return Object.entries(groups).map(([label, info]) => {
+                const color = label === 'قشر خاکستری' ? '#9ca3af' : (info.color || '#999999');
+                const count = info.count || 0;
+                const meta = formatMeta(info.meta);
+                return `<div class="legend-item">
+                    <span class="color-box" style="background:${color}"></span>
+                    <span class="label">${label}</span>
+                    <span class="count">(${count} عضو)</span>
+                    ${meta ? `<span class="meta">${meta}</span>` : ''}
+                </div>`;
+            }).join('');
+        }
+
+        function activeTopicData() {
+            return timelineTopics[currentTopic] || {label: '', modes: {}};
+        }
+
+        function activeModes() {
+            return activeTopicData().modes || {};
+        }
+
+        function setDefaultModeForTopic() {
+            const modes = activeModes();
+            currentMode = modes[defaultMode] ? defaultMode : (Object.keys(modes)[0] || '');
+        }
+
+        function populateTopicSelect() {
+            const sel = document.getElementById('topicSelect');
+            sel.innerHTML = '';
+            Object.entries(timelineTopics).forEach(([key, data]) => {
+                const option = document.createElement('option');
+                option.value = key;
+                option.textContent = data.label || key;
+                sel.appendChild(option);
+            });
+            sel.value = currentTopic;
+            sel.addEventListener('change', () => {
+                currentTopic = sel.value;
+                currentIndex = 0;
+                currentParty = '';
+                setDefaultModeForTopic();
+                populateModeSelect();
+                populatePartySelect();
+                showGraph(0);
+            });
+        }
+
+        function populateModeSelect() {
+            const sel = document.getElementById('modeSelect');
+            const modes = activeModes();
+            sel.innerHTML = '';
+            Object.entries(modes).forEach(([mode, data]) => {
+                const option = document.createElement('option');
+                option.value = mode;
+                option.textContent = data.label || mode;
+                sel.appendChild(option);
+            });
+            sel.disabled = Object.keys(modes).length === 0;
+            sel.value = currentMode;
+            sel.onchange = () => {
+                currentMode = sel.value;
+                currentIndex = 0;
+                populatePartySelect();
+                showGraph(0);
+            };
+        }
+
+        function partiesForCurrentMode() {
+            const counts = {};
+            currentItems().forEach(item => {
+                Object.entries(item.partyFocus || {}).forEach(([party, info]) => {
+                    counts[party] = (counts[party] || 0) + (info.total || 0);
+                });
+            });
+            return Object.entries(counts)
+                .sort((a, b) => b[1] - a[1])
+                .map(([party]) => party);
+        }
+
+        function populatePartySelect() {
+            const sel = document.getElementById('partySelect');
+            const parties = partiesForCurrentMode();
+            sel.innerHTML = '';
+            if (parties.length === 0) {
+                const option = document.createElement('option');
+                option.value = '';
+                option.textContent = 'بدون داده';
+                sel.appendChild(option);
+            }
+            parties.forEach(party => {
+                const option = document.createElement('option');
+                option.value = party;
+                option.textContent = party;
+                sel.appendChild(option);
+            });
+            if (!parties.includes(currentParty)) currentParty = parties[0] || '';
+            sel.value = currentParty;
+            sel.disabled = parties.length === 0;
+            sel.onchange = () => {
+                currentParty = sel.value;
+                updatePartyFocus();
+            };
+            document.getElementById('partyFocusPanel').hidden = parties.length === 0;
+        }
+
+        function currentItems() {
+            const modes = activeModes();
+            return (modes[currentMode] && modes[currentMode].items) || [];
+        }
+
+        function showGraph(index) {
+            const items = currentItems();
+            const topic = activeTopicData();
+            document.getElementById('topicBanner').textContent = `موضوع: ${topic.label || '---'}`;
+            if (items.length === 0) {
+                currentIndex = 0;
+                document.getElementById('timelineFrame').src = 'about:blank';
+                document.getElementById('timelineFrame').hidden = true;
+                document.getElementById('emptyTopicState').hidden = false;
+                document.getElementById('hybridLegendTitle').textContent = 'روش ترکیبی';
+                document.getElementById('hybridLegend').innerHTML = buildLegend({});
+                updateUI();
+                updatePartyFocus();
+                return;
+            }
+            const bounded = Math.max(0, Math.min(index, items.length - 1));
+            const item = items[bounded];
+            currentIndex = bounded;
+            document.getElementById('timelineFrame').hidden = false;
+            document.getElementById('emptyTopicState').hidden = true;
+            document.getElementById('timelineFrame').src = item.dashboard;
+            document.getElementById('timelineFrame').title = item.dashboard;
+            const hybridGroups = item.legends?.hybrid?.groups || {};
+            document.getElementById('hybridLegendTitle').textContent = 'روش ترکیبی';
+            document.getElementById('hybridLegend').innerHTML = buildLegend(hybridGroups);
+            updateUI();
+            updatePartyFocus();
+        }
+
+        function updatePartyFocus() {
+            const items = currentItems();
+            const item = items[currentIndex] || {};
+            const info = (item.partyFocus || {})[currentParty] || {total: 0, incoming: 0, outgoing: 0, topics: []};
+            document.getElementById('partyFocusTitle').textContent = currentParty ? `نمای حزب: ${currentParty}` : 'نمای حزب';
+            document.getElementById('partyTotal').textContent = info.total || 0;
+            document.getElementById('partyOutgoing').textContent = info.outgoing || 0;
+            document.getElementById('partyIncoming').textContent = info.incoming || 0;
+
+            const topics = info.topics || [];
+            const maxTopic = Math.max(1, ...topics.map(t => t.count || 0));
+            document.getElementById('partyTopics').innerHTML = topics.length
+                ? topics.map(t => `<div class="topic-row">
+                    <span class="topic-label" title="${t.label}">${t.label}</span>
+                    <strong>${t.count || 0}</strong>
+                    <div class="topic-bar"><span style="width:${((t.count || 0) / maxTopic) * 100}%"></span></div>
+                </div>`).join('')
+                : '<div class="legend-item"><span class="label">داده‌ای برای این بازه نیست</span></div>';
+
+            const maxSlot = Math.max(1, ...items.map(i => ((i.partyFocus || {})[currentParty] || {}).total || 0));
+            document.getElementById('partyTimeline').innerHTML = items.map((slot, idx) => {
+                const total = ((slot.partyFocus || {})[currentParty] || {}).total || 0;
+                const height = Math.max(4, (total / maxSlot) * 44);
+                return `<button class="${idx === currentIndex ? 'active' : ''}" style="height:${height}px" title="${slot.range}: ${total}" onclick="showGraph(${idx})"></button>`;
+            }).join('');
+        }
+        
+        function navigate(direction) {
+            const newIndex = currentIndex + direction;
+            const items = currentItems();
+            if (newIndex >= 0 && newIndex < items.length) {
+                showGraph(newIndex);
+            }
+        }
+        
+        function updateUI() {
+            const items = currentItems();
+            const item = items[currentIndex] || {};
+            const mode = activeModes()[currentMode] || {};
+            document.getElementById('currentSlot').textContent = items.length ? ('بازه ' + (currentIndex + 1)) : 'بازه 0';
+            document.getElementById('totalSlots').textContent = items.length;
+            document.getElementById('slotRange').textContent = item.range || '---';
+            document.getElementById('slotMode').textContent = mode.label || currentMode || '---';
+            document.getElementById('prevBtn').disabled = currentIndex === 0;
+            document.getElementById('nextBtn').disabled = currentIndex >= items.length - 1;
+            
+            const progress = items.length ? ((currentIndex + 1) / items.length) * 100 : 0;
+            document.getElementById('progressBar').style.width = progress + '%';
+        }
+        
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+                navigate(e.key === 'ArrowRight' ? -1 : 1);
+            }
+        });
+        
+        window.addEventListener('load', () => {
+            setDefaultModeForTopic();
+            populateTopicSelect();
+            populateModeSelect();
+            populatePartySelect();
+            showGraph(0);
+        });
+    </script>
+</body>
+</html>

@@ -131,6 +131,54 @@ class CommunityNamingPipelineTests(unittest.TestCase):
             self.assertEqual(saved["nodes"], [])
             self.assertEqual(saved["partyFocus"]["parties"][0]["name"], "اصولگرا")
 
+    def test_timeline_dashboard_skips_missing_template(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dashboard = root / "dashboard_daily_260101_to_260102.html"
+            dashboard.write_text("<html></html>", encoding="utf-8")
+            with patch.object(
+                community_detection, "resolve_timeline_template", return_value=None
+            ):
+                community_detection.generate_timeline_dashboard(
+                    output_file=str(root / "timeline_dashboard.html"),
+                    topic_label="جنگ",
+                    mode_dashboards={
+                        "daily": [
+                            {
+                                "file": str(dashboard),
+                                "start": "2026-01-01",
+                                "end": "2026-01-02",
+                            }
+                        ]
+                    },
+                )
+            self.assertFalse((root / "timeline_dashboard.html").exists())
+
+    def test_timeline_dashboard_uses_bundled_template(self):
+        template = community_detection.resolve_timeline_template()
+        self.assertTrue(template)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dashboard = root / "dashboard_daily_260101_to_260102.html"
+            dashboard.write_text("<html></html>", encoding="utf-8")
+            output = root / "timeline_dashboard.html"
+            community_detection.generate_timeline_dashboard(
+                output_file=str(output),
+                topic_label="جنگ",
+                mode_dashboards={
+                    "daily": [
+                        {
+                            "file": str(dashboard),
+                            "start": "2026-01-01",
+                            "end": "2026-01-02",
+                        }
+                    ]
+                },
+            )
+            html = output.read_text(encoding="utf-8")
+            self.assertIn("جنگ", html)
+            self.assertIn("daily", html)
+
 
 if __name__ == "__main__":
     unittest.main()

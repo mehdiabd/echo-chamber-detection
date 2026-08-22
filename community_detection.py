@@ -3453,6 +3453,17 @@ def build_timeline_topics(topic_label, timeline_modes, topic_options=None):
     return active_key, topics, options
 
 
+def resolve_timeline_template():
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in (
+        os.path.join(os.getcwd(), "timeline_template.html"),
+        os.path.join(here, "timeline_template.html"),
+    ):
+        if os.path.isfile(path):
+            return path
+    return None
+
+
 def generate_timeline_dashboard(output_file="timeline_dashboard.html", topic_label=None,
                                 mode_dashboards=None, topic_options=None):
     """Generate a dashboard that can switch between real slot modes."""
@@ -3552,7 +3563,11 @@ def generate_timeline_dashboard(output_file="timeline_dashboard.html", topic_lab
         topic_options=topic_options,
     )
 
-    with open("timeline_template.html", "r", encoding="utf-8") as f:
+    template_path = resolve_timeline_template()
+    if not template_path:
+        print("[warn] timeline_template.html is missing; skipping timeline dashboard.")
+        return
+    with open(template_path, "r", encoding="utf-8") as f:
         template = f.read()
 
     html = (
@@ -3702,10 +3717,13 @@ if __name__ == "__main__":
                 })
 
     print("[done] Community detection completed.")
-    generate_timeline_dashboard(
-        mode_dashboards=mode_dashboards,
-        topic_label=topic_label,
-    )
+    try:
+        generate_timeline_dashboard(
+            mode_dashboards=mode_dashboards,
+            topic_label=topic_label,
+        )
+    except Exception as exc:
+        print(f"[warn] Timeline dashboard was not generated: {exc}")
     removed = clean_project_root()
     if removed:
         print(f"[cleanup] Rotated {len(removed)} generated artifacts from project root.")

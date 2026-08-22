@@ -71,6 +71,12 @@ PROGRESS_STEPS = (
     ("detect", "تشخیص جوامع"),
     ("ready", "آماده‌سازی داشبورد"),
 )
+SLOT_PROGRESS_RE = re.compile(
+    r"\[slot\s+(\d+)/(\d+)\s*\|\s*([^\]]+)\](?:\s+Processing:\s*(\S+)\s+to\s+(\S+))?"
+)
+SCAN_PROGRESS_RE = re.compile(
+    r"\[scan-progress\]\s+(\w+)\s+docs=(\d+)"
+)
 
 PipelineExecutor = Callable[[Path, dict[str, Any], Path, str], dict[str, Any]]
 
@@ -295,6 +301,63 @@ def write_progress(log_file: Path, percent: int, stage: str, message: str) -> No
     )
 
 
+def infer_live_progress(log_text: str) -> tuple[int, str, str]:
+    percent = 0
+    stage = "queued"
+    message = ""
+    if "elastic.py" in log_text:
+        percent, stage, message = 15, "fetch", "در حال دریافت از الستیک"
+        if "Starting initial scan" in log_text:
+            percent, message = 20, "اسکن اولیه الستیک"
+        last_scan = None
+        for match in SCAN_PROGRESS_RE.finditer(log_text):
+            last_scan = match
+        if last_scan:
+            label, docs = last_scan.group(1), last_scan.group(2)
+            if label == "interaction_scan":
+                percent, message = 38, f"جمع‌آوری تعاملات از الستیک — {docs} سند"
+            else:
+                percent, message = 25, f"اسکن اولیه الستیک — {docs} سند"
+        if "Total hits:" in log_text:
+            percent, message = max(percent, 32), "جمع‌آوری تعاملات از الستیک"
+        if "Starting scan to collect interactions" in log_text:
+            percent, message = max(percent, 35), "جمع‌آوری تعاملات از الستیک"
+        if "Finished full pipeline." in log_text:
+            percent, message = 50, "دریافت الستیک تمام شد"
+    if "community_detection.py" in log_text:
+        percent, stage, message = max(percent, 60), "detect", "در حال تشخیص جوامع"
+        last_slot = None
+        for match in SLOT_PROGRESS_RE.finditer(log_text):
+            last_slot = match
+        if last_slot:
+            current = int(last_slot.group(1))
+            total = max(1, int(last_slot.group(2)))
+            mode = last_slot.group(3).strip()
+            start = (last_slot.group(4) or "").rstrip(".")
+            percent = 60 + int(35 * current / total)
+            message = f"تشخیص جوامع: اسلات {current} از {total} ({mode})"
+            if start:
+                message += f" — {start}"
+        if "[done] Community detection completed." in log_text:
+            percent, message = 95, "آماده‌سازی داشبورد"
+    return percent, stage, message
+
+
+def command_failure_message(log_file: Path, command: list[str], returncode: int) -> str:
+    prefix = f"command failed ({returncode}): {' '.join(command)}"
+    try:
+        lines = Path(log_file).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return prefix
+    for line in reversed(lines):
+        text = line.strip()
+        if not text or text.startswith("$ ") or text.startswith("[error]"):
+            continue
+        if "Error" in text or "Exception" in text:
+            return f"{prefix}: {text}"
+    return prefix
+
+
 def read_progress(log_path: str | Path | None, status: str, error: str = "") -> dict[str, Any]:
     percent = 0
     stage = "queued"
@@ -316,14 +379,11 @@ def read_progress(log_path: str | Path | None, status: str, error: str = "") -> 
                 text = log_file.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 text = ""
-            if "community_detection.py" in text:
-                percent = max(percent, 60)
-                stage = "detect"
-                message = message or "در حال تشخیص جوامع"
-            elif "elastic.py" in text:
-                percent = max(percent, 15)
-                stage = "fetch"
-                message = message or "در حال دریافت از الستیک"
+            inferred_percent, inferred_stage, inferred_message = infer_live_progress(text)
+            if inferred_percent:
+                percent = max(percent, inferred_percent)
+                stage = inferred_stage or stage
+                message = inferred_message or message
     if status == "failed" and error:
         message = error
     return progress_payload(status, percent, stage, message)
@@ -1328,7 +1388,7 @@ def execute_pipeline(
             )
         if process.returncode != 0:
             raise RuntimeError(
-                f"command failed ({process.returncode}): {' '.join(command)}"
+                command_failure_message(log_file, command, process.returncode)
             )
 
     write_progress(log_file, 5, "queued", "شروع اجرا")
