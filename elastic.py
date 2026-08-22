@@ -459,7 +459,7 @@ primary_scan = scan(
 usernames = set()
 COUNT = 0
 with open("res.json", "w", encoding="utf-8") as f:
-    for doc in result:
+    for doc in primary_scan:
         source = doc["_source"]
         raw_type = source.get("type")
         tweet_type = normalize_tweet_type(raw_type)
@@ -493,7 +493,7 @@ with open("interactions.json", "w", encoding="utf-8") as f_interactions:
     scanned_docs = 0
     EXAMPLE_LIMIT = 10
     EXAMPLE_PRINTED = 0
-    for doc in result:
+    for doc in interaction_scan:
         scanned_docs += 1
         if args.max_scan_docs and scanned_docs > args.max_scan_docs:
             log.info(f"Reached --max-scan-docs={args.max_scan_docs} in interaction scan.")
@@ -597,8 +597,8 @@ with open("interactions.json", "w", encoding="utf-8") as f_interactions:
                     if target and not same_user(target, sender):
                         interaction = {
                             "sender": sender,
-                            "target": retweeted_user,
-                            "type": "repost",
+                            "target": target,
+                            "type": "mention",
                             "date": date_str
                         }
                         log.info(f"Writing interaction: {interaction}")
@@ -649,11 +649,6 @@ with open("interactions.json", "w", encoding="utf-8") as f_interactions:
                     # Only warn once for missing mentions
                     # log.warning("⛔ Skipped post: No mentions found (entity or text).")
                     continue
-finally:
-    try:
-        interaction_scan.close()
-    except Exception:
-        pass
 
 log.warning(f"✅ TOTAL INTERACTIONS WRITTEN: {written}")
 log.info("Extracted interactions written to interactions.json")
