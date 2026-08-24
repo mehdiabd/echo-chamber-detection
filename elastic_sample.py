@@ -9,16 +9,15 @@ from collections import defaultdict
 
 # --- Connect to Production Elasticsearch ---
 print("Using Production Elasticsearch.")
-cur_path = os.path.dirname(__file__)
-CERTIFICATE = os.path.join(cur_path, "ca.crt")
-ELASTICSEARCH_URL = "https://192.168.59.79:9200"
+cur_path = os.path.dirname(__file__)  # still used further down for convertor.py
+# Public hostname behind Kong; no local CA file needed (see elastic.py).
+ELASTICSEARCH_URL = "https://elastic.synappse.ir"
 AUTH = "YXYyeVRKWUJKSFpwMVdrTnZWRDc6UHhqRHBQa2ZUYW1yMnBwWTV3Ri0xUQ=="
 INDEX = "twitter_temp_data"
 
 es = Elasticsearch(
     ELASTICSEARCH_URL,
     api_key=AUTH,
-    ca_certs=CERTIFICATE,
     verify_certs=True,
     ssl_show_warn=False
 )

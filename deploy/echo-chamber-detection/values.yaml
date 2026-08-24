@@ -1,0 +1,117 @@
+# DEV-owned config for echo-chamber-detection (FastAPI service, deploys to ae-01,
+# namespace synappse-data-science). Image tag is set by CI at deploy time.
+replicaCount: 1
+
+image:
+  # Path convention for this group is data-science-projects/<name> (no analytics-team
+  # prefix), matching ner, rag, ad-detection and the rest. This MUST stay identical to
+  # IMAGE_NAME in infra/ci-templates, or CI builds one path while Argo deploys another.
+  repository: synappse.repo.stinascloud.ir/data-science-projects/echo-chamber-detection
+
+imagePullSecrets:
+- name: nexus-access
+
+# The app listens on 8765 (see the Dockerfile's EXPOSE / echo_chamber_api.py default).
+service:
+  type: ClusterIP
+  port: 8765
+
+# CPU-only service - no nvidia.com/gpu, so it schedules on any ae-01 worker.
+# matplotlib/scikit-learn/node2vec plus an Elasticsearch scan need real headroom;
+# the request is deliberately modest so it is not an eviction magnet at rest.
+resources:
+  requests:
+    cpu: 100m
+    memory: 512Mi
+  limits:
+    cpu: '2'
+    memory: 4Gi
+
+# /health is a real endpoint on this API, so use it. Without a readiness probe the pod is
+# marked Ready the instant the container starts, which advertises the endpoint before
+# uvicorn is listening and leaves ingress-nginx with an empty upstream (503).
+healthChecks:
+  readiness:
+    enabled: true
+    path: /health
+    port: http
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 6
+  liveness:
+    enabled: true
+    path: /health
+    port: http
+    initialDelaySeconds: 30
+    periodSeconds: 20
+    timeoutSeconds: 5
+    failureThreshold: 6
+
+env:
+# Bind on all interfaces and the documented port.
+- name: ECHO_API_HOST
+  value: '0.0.0.0'
+- name: ECHO_API_PORT
+  value: '8765'
+# SQLite lives on the mounted volume, NOT the container filesystem. These databases hold
+# authoritative data that cannot be regenerated from Elasticsearch - human review labels
+# (POST /api/v1/review/labels) and pipeline run history - so they must survive a restart.
+- name: ECHO_API_DB_PATH
+  value: /app/runtime_data/echo_chamber.sqlite3
+- name: PARTY_CHANGE_DB_PATH
+  value: /app/runtime_data/party_changes.sqlite3
+# Elasticsearch selector. "1" is the code's own default and picks
+# https://192.168.59.79:9200 (index twitter_temp_data), which is reachable from ae-01.
+# "2" would select 192.168.59.26. Credentials for both are currently hardcoded in
+# elastic_client.py - see the README note about moving them to ESO/Vault.
+- name: ELASTIC_AUTH
+  value: '1'
+# Without this, community_detection.py logs
+#   "[party-change] Detected N transition(s); API is not configured, so they were not persisted."
+# and throws the results away. docker-compose sets it to http://api:8765/...; the
+# in-cluster equivalent is this app's own Service, so the detections land in
+# party_changes.sqlite3 on the PVC via POST /api/v1/party-changes.
+- name: PARTY_CHANGE_API_URL
+  value: 'http://echo-chamber-detection-template:8765/api/v1/party-changes'
+
+# Persistent storage for runtime_data. The `template` chart has no PVC template of its own,
+# so the claim is created separately (paas: manifest/synappse-data-science/
+# echo-chamber-detection-pvc.yaml) and only referenced here.
+volumes:
+- name: runtime-data
+  persistentVolumeClaim:
+    claimName: echo-chamber-detection-runtime-data
+
+volumeMounts:
+- name: runtime-data
+  mountPath: /app/runtime_data
+# Pipeline reports persist on the PVC instead of the container's ephemeral layer.
+# community_detection.py writes them to a HARDCODED relative "communities/" (see
+# save_hybrid_report(output_dir="communities") and the os.makedirs("communities") call),
+# i.e. into the working directory /app - which is destroyed every time the pod is
+# replaced. Three deploys on 2026-08-22 (1.0.8 -> 1.0.9 -> 1.0.10) each wiped every
+# report and dashboard, and the only reason they were recoverable was a manual copy.
+# subPath "communities" is the same directory as /app/runtime_data/communities, so the
+# reports are also reachable through the existing mount.
+- name: runtime-data
+  mountPath: /app/communities
+  subPath: communities
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    nginx.ingress.kubernetes.io/proxy-body-size: '0'
+    # Community detection and Elasticsearch scans can run long.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: '300'
+    nginx.ingress.kubernetes.io/proxy-send-timeout: '300'
+  hosts:
+  - host: api.synappse.ir
+    paths:
+    # Matches the convention already used on this host (/api/chatbot, /api/basir,
+    # /api/image-search-engine-api). The (/|$)(.*) capture plus rewrite-target /$2 means
+    # /api/echo-chamber/api/v1/reports reaches the app as /api/v1/reports.
+    - path: /api/echo-chamber(/|$)(.*)
+      pathType: ImplementationSpecific

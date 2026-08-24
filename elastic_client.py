@@ -77,10 +77,17 @@ def create_es_client(auth_type: str | None = None) -> Tuple[Elasticsearch, str]:
     selected = (auth_type or os.getenv("ELASTIC_AUTH") or "1").strip()
 
     if selected == "1":
+        # Public hostname behind Kong, which terminates TLS with a publicly trusted
+        # certificate - so no ca_certs/local CA file is needed and none should be set.
+        # The previous value pointed straight at https://192.168.59.79:9200 with
+        # ca_certs=<repo>/ca.crt; because .gitignore excludes *.crt that file was never
+        # in the image, and every pipeline run died with
+        # "TlsError: SSLError([Errno 2] No such file or directory)".
         es = Elasticsearch(
-            "https://192.168.59.79:9200",
+            "https://elastic.synappse.ir",
             api_key="YXYyeVRKWUJKSFpwMVdrTnZWRDc6UHhqRHBQa2ZUYW1yMnBwWTV3Ri0xUQ==",
-            **ssl_client_kwargs("ca.crt"),
+            verify_certs=True,
+            ssl_show_warn=False,
         )
         return es, "twitter_temp_data"
 
