@@ -3,6 +3,7 @@ import os
 import sys
 import subprocess
 import json
+import time
 from datetime import datetime, timedelta
 from elasticsearch.helpers import scan
 from collections import Counter
@@ -360,16 +361,20 @@ def _extract_user(obj):
 def _log_count(label, query):
     try:
         res = es.count(index=INDEX, body={"query": query})
-        log.warning(f"[count] {label}: {res.get('count')}")
+        count = res.get("count")
+        log.warning(f"[count] {label}: {count}")
+        return count
     except Exception as e:
         log.warning(f"[count] {label} failed: {e}")
+        return None
 
 # Diagnostics: check whether data exists in date range and whether query filters too hard
+expected_docs = None
 try:
     date_only_query = {"range": {"date": {"gte": start_date, "lte": end_date, "format": "yyyy-MM-dd"}}}
     _log_count("date_only", date_only_query)
     _log_count("query_only", query_body["query"]["bool"]["must"][0])
-    _log_count("query_and_date", query_body["query"])
+    expected_docs = _log_count("query_and_date", query_body["query"])
     # Index min/max date for alignment
     try:
         min_date = es.search(
@@ -439,6 +444,23 @@ try:
 except Exception as e:
     log.warning(f"[count] diagnostics skipped: {e}")
 
+scan_total = expected_docs
+if args.max_scan_docs:
+    scan_total = (
+        args.max_scan_docs
+        if not scan_total
+        else min(int(scan_total), int(args.max_scan_docs))
+    )
+
+def _scan_progress(label, docs, started):
+    elapsed_s = max(0, int(time.monotonic() - started))
+    if scan_total:
+        log.warning(
+            f"[scan-progress] {label} docs={docs} total={scan_total} elapsed_s={elapsed_s}"
+        )
+    else:
+        log.warning(f"[scan-progress] {label} docs={docs} elapsed_s={elapsed_s}")
+
 log.warning("Starting initial scan query...")
 primary_scan = scan(
     es,
@@ -451,6 +473,8 @@ primary_scan = scan(
 # Extract all distinct author usernames.
 usernames = set()
 COUNT = 0
+initial_scan_started = time.monotonic()
+_scan_progress("initial_scan", 0, initial_scan_started)
 try:
     with open("res.json", "w", encoding="utf-8") as f:
         for doc in primary_scan:
@@ -464,7 +488,7 @@ try:
             f.write("\n")
             COUNT += 1
             if COUNT == 1 or COUNT % 200 == 0:
-                log.warning(f"[scan-progress] initial_scan docs={COUNT}")
+                _scan_progress("initial_scan", COUNT, initial_scan_started)
             uname = normalize_user_handle(source.get("user_name"))
             if uname:
                 usernames.add(uname)
@@ -486,6 +510,8 @@ interaction_scan = scan(
 )
 
 interaction_usernames = set(usernames)
+interaction_scan_started = time.monotonic()
+_scan_progress("interaction_scan", 0, interaction_scan_started)
 try:
     with open("interactions.json", "w", encoding="utf-8") as f_interactions:
         written = 0
@@ -495,7 +521,7 @@ try:
         for doc in interaction_scan:
             scanned_docs += 1
             if scanned_docs == 1 or scanned_docs % 200 == 0:
-                log.warning(f"[scan-progress] interaction_scan docs={scanned_docs}")
+                _scan_progress("interaction_scan", scanned_docs, interaction_scan_started)
             if args.max_scan_docs and scanned_docs > args.max_scan_docs:
                 log.info(f"Reached --max-scan-docs={args.max_scan_docs} in interaction scan.")
                 break

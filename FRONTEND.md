@@ -1,64 +1,71 @@
-# پنل تحلیلی نمای احزاب
-
-دادهٔ پنل کنار گراف از همان endpoint جزئیات اسلات می‌آید.
-
-`GET /api/v1/dashboards/{slot_id}`
+# تاریخچه ران‌ها: زمان باقی‌مانده، توقف، ری‌استارت
 
 پایهٔ لوکال: `http://localhost:8765`  
-نمونه: `GET http://localhost:8765/api/v1/dashboards/daily_260101_to_260102`
+پایهٔ پروداکشن: `https://api.synappse.ir/api/echo-chamber`
 
----
+برای بخش تاریخچه ران‌ها در صفحهٔ `/pipeline`.
 
-## کجا بخوانی
-
-`partyFocus` هم‌سطح `graph` است. گراف را از `graph.nodes` / `graph.edges` بکش و پنل را از `partyFocus.parties`.
-
-لیست اسلات‌ها (`GET /api/v1/dashboards`) این فیلد را ندارد.
-
----
-
-## شکل پاسخ
+هر ۲ تا ۳ ثانیه `GET /api/v1/pipeline/runs` یا `GET /api/v1/pipeline/runs/{run_id}` را poll کن.
 
 ```json
 {
-  "id": "daily_260101_to_260102",
-  "graph": {
-    "node_count": 3,
-    "edge_count": 2,
-    "nodes": [],
-    "edges": []
+  "run_id": "…",
+  "status": "running",
+  "progress": {
+    "percent": 22,
+    "remaining_percent": 78,
+    "remaining_seconds": 780,
+    "remaining_label": "حدود 13 دقیقه",
+    "elapsed_seconds": 240,
+    "docs_done": 400,
+    "docs_total": 8000,
+    "stage": "fetch",
+    "message": "اسکن اولیه الستیک — 400/8000 سند"
   },
-  "partyFocus": {
-    "parties": [
-      {
-        "name": "جریان زن‌زندگی‌آزادی",
-        "stats": {
-          "total": 438,
-          "outgoing": 209,
-          "incoming": 229
-        },
-        "top_interactions": [
-          {"type": "نقل‌قول", "handle": "@CENTCOM", "count": 15},
-          {"type": "ذکر", "handle": "@PMN_Amy", "count": 10},
-          {"type": "ذکر", "handle": "@kokchanews", "count": 8}
-        ]
-      }
-    ]
-  }
+  "actions": {
+    "can_stop": true,
+    "can_restart": true
+  },
+  "error": null
 }
 ```
 
-`parties` بر اساس `stats.total` نزولی است. حداکثر ۶ مورد در `top_interactions`.
+| فیلد | UI |
+|---|---|
+| `progress.remaining_label` | متن زمان مانده؛ کنار وضعیت ران نشان بده |
+| `progress.remaining_seconds` | ثانیهٔ مانده؛ اگر هنوز قابل تخمین نباشد `null` |
+| `progress.elapsed_seconds` | زمان گذشته از شروع |
+| `progress.docs_done` / `docs_total` | پیشرفت اسکن الستیک (اگر در مرحلهٔ دریافت باشد) |
+| `status` | `queued` `running` `done` `failed` `cancelled` |
+| `actions.can_stop` | دکمهٔ توقف |
+| `actions.can_restart` | دکمهٔ اجرای دوباره |
 
-`type` معمولاً `نقل‌قول` یا `ذکر` است (گاهی `بازنشر` / `پاسخ` / `تعامل`).
+اگر `remaining_seconds === null` همان `در حال محاسبه` را نشان بده.
 
----
+## توقف
 
-## رندر UI
+`POST /api/v1/pipeline/runs/{run_id}/stop`
 
-1. دراپ‌داون «نمای حزب»: `parties[].name` — پیش‌فرض اولین آیتم.
-2. سه کارت حزب انتخاب‌شده: `stats.total` (کل تعامل)، `stats.outgoing` (خروجی)، `stats.incoming` (ورودی).
-3. لیست `top_interactions`: راست `type` + `handle`، چپ `count`.
-4. عرض نوار: `count / max(top_interactions.count)` برای همان حزب.
+فقط برای `queued` یا `running`. پاسخ `200` با `status: "cancelled"`. اگر ران تمام شده باشد `409`.
 
-اگر `parties` خالی است پنل را نشان نده. آرتیفکت قدیمی بدون `partyFocus` داخل `hybrid_graph_*.json` مقدار `{"parties": []}` می‌دهد؛ پایپلاین را دوباره اجرا کن.
+## ری‌استارت
+
+`POST /api/v1/pipeline/runs/{run_id}/restart`
+
+اگر ران هنوز فعال باشد اول متوقف می‌شود، بعد یک ران جدید با همان پارامترها ساخته می‌شود. پاسخ `202` به‌علاوهٔ `restarted_from`. اگر ران دیگری در حال اجرا باشد `409`.
+
+```json
+{
+  "run_id": "…",
+  "status": "queued",
+  "restarted_from": "2568abb5131440e594e09d16283f888d",
+  "progress": {
+    "percent": 0,
+    "remaining_seconds": null,
+    "remaining_label": "در حال محاسبه",
+    "stage": "queued",
+    "message": "در صف"
+  },
+  "actions": {"can_stop": true, "can_restart": true}
+}
+```

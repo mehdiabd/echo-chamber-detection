@@ -12,6 +12,7 @@ import json
 import os
 import random
 import re
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -52,6 +53,8 @@ STATIC_ALLOW = {
 }
 MEMBER_LIMIT = 500
 LOG_TAIL_LINES = 80
+LOG_TAIL_BYTES = 96_000
+STOPPABLE_STATUSES = ("queued", "running")
 PRELOADED_TOPICS = (
     {"label": "جنگ جمهوری اسلامی و آمریکا", "query": "جنگ جمهوری اسلامی و آمریکا"},
     {"label": "#همکاری_ملی", "query": "#همکاری_ملی"},
@@ -75,10 +78,15 @@ SLOT_PROGRESS_RE = re.compile(
     r"\[slot\s+(\d+)/(\d+)\s*\|\s*([^\]]+)\](?:\s+Processing:\s*(\S+)\s+to\s+(\S+))?"
 )
 SCAN_PROGRESS_RE = re.compile(
-    r"\[scan-progress\]\s+(\w+)\s+docs=(\d+)"
+    r"\[scan-progress\]\s+(\w+)\s+docs=(\d+)(?:\s+total=(\d+))?(?:\s+elapsed_s=(\d+))?"
 )
+COUNT_PROGRESS_RE = re.compile(r"\[count\]\s+query_and_date:\s+(\d+)")
 
 PipelineExecutor = Callable[[Path, dict[str, Any], Path, str], dict[str, Any]]
+
+
+class PipelineCancelled(Exception):
+    """Raised when a pipeline run is stopped by the user."""
 
 
 def utc_now() -> str:
@@ -242,45 +250,169 @@ def topics_are_covered(requested: list[dict[str, str]], config: dict[str, Any]) 
     return wanted <= config_topic_keys(config)
 
 
+def parse_utc(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    text = str(value).strip().replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def format_remaining_label(seconds: int | None, *, calculating: bool = False) -> str | None:
+    if seconds is None:
+        return "در حال محاسبه" if calculating else None
+    if seconds <= 0:
+        return "کمتر از یک دقیقه"
+    if seconds < 60:
+        return "کمتر از یک دقیقه"
+    minutes = int(round(seconds / 60))
+    if minutes < 60:
+        return f"حدود {minutes} دقیقه"
+    hours, rest = divmod(minutes, 60)
+    if rest == 0:
+        return f"حدود {hours} ساعت"
+    return f"حدود {hours} ساعت و {rest} دقیقه"
+
+
+def run_actions(status: str) -> dict[str, bool]:
+    active = status in STOPPABLE_STATUSES
+    return {"can_stop": active, "can_restart": True}
+
+
+def read_text_tail(path: Path, max_bytes: int = LOG_TAIL_BYTES) -> str:
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - max_bytes))
+            data = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+    if not data:
+        return ""
+    if size > max_bytes:
+        newline = data.find("\n")
+        if newline >= 0:
+            data = data[newline + 1 :]
+    return data
+
+
+def read_log_tail_lines(path: Path | None, max_lines: int = LOG_TAIL_LINES) -> list[str]:
+    if not path:
+        return []
+    log_file = Path(path)
+    if not log_file.is_file():
+        return []
+    text = read_text_tail(log_file)
+    if not text:
+        return []
+    return text.splitlines()[-max_lines:]
+
+
+def read_pid_file(path: Path | None) -> int | None:
+    if not path:
+        return None
+    try:
+        raw = Path(path).read_text(encoding="utf-8").strip()
+        pid = int(raw)
+    except (OSError, TypeError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
+
+def terminate_pid(pid: int | None, process: subprocess.Popen[Any] | None = None) -> None:
+    if process is not None and process.poll() is not None:
+        process = None
+    target = pid or (process.pid if process is not None else None)
+    if not target:
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(target, sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            if process is not None:
+                try:
+                    process.send_signal(sig)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+        if process is not None and process.poll() is not None:
+            return
+
+
 def progress_payload(
     status: str,
     percent: int = 0,
     stage: str = "",
     message: str = "",
+    remaining_seconds: int | None = None,
+    elapsed_seconds: int | None = None,
+    docs_done: int | None = None,
+    docs_total: int | None = None,
 ) -> dict[str, Any]:
     status = str(status or "queued")
+    calculating = False
     if status == "queued":
         percent, stage, message = 0, "queued", message or "در صف"
+        remaining_seconds = None
+        calculating = True
     elif status == "done":
         percent, stage, message = 100, "ready", message or "تکمیل شد"
+        remaining_seconds = 0
     elif status == "failed":
         percent = max(0, min(100, int(percent)))
         stage = stage or "fetch"
         message = message or "خطا در اجرا"
+        remaining_seconds = None
+    elif status == "cancelled":
+        percent = max(0, min(100, int(percent)))
+        stage = stage or "fetch"
+        message = message or "متوقف شد"
+        remaining_seconds = None
     else:
         percent = max(0, min(100, int(percent)))
         stage = stage or "fetch"
         message = message or "در حال اجرا"
+        calculating = remaining_seconds is None
     reached = False
     steps = []
     for step_id, label in PROGRESS_STEPS:
         if status == "done":
             state = "done"
         elif step_id == stage:
-            state = "failed" if status == "failed" else ("done" if percent >= 100 else "running")
+            if status == "failed":
+                state = "failed"
+            elif status == "cancelled":
+                state = "cancelled"
+            else:
+                state = "done" if percent >= 100 else "running"
             reached = True
         elif not reached:
             state = "done"
         else:
             state = "pending"
         steps.append({"id": step_id, "label": label, "status": state})
-    return {
+    payload: dict[str, Any] = {
         "percent": percent,
         "remaining_percent": max(0, 100 - percent),
+        "remaining_seconds": remaining_seconds,
+        "remaining_label": format_remaining_label(
+            remaining_seconds, calculating=calculating and status in STOPPABLE_STATUSES
+        ),
+        "elapsed_seconds": elapsed_seconds,
         "stage": stage,
         "message": message,
         "steps": steps,
     }
+    if docs_done is not None:
+        payload["docs_done"] = docs_done
+    if docs_total is not None:
+        payload["docs_total"] = docs_total
+    return payload
 
 
 def write_progress(log_file: Path, percent: int, stage: str, message: str) -> None:
@@ -301,29 +433,55 @@ def write_progress(log_file: Path, percent: int, stage: str, message: str) -> No
     )
 
 
-def infer_live_progress(log_text: str) -> tuple[int, str, str]:
+def infer_live_progress(log_text: str) -> dict[str, Any]:
     percent = 0
     stage = "queued"
     message = ""
+    extra: dict[str, Any] = {}
     if "elastic.py" in log_text:
         percent, stage, message = 15, "fetch", "در حال دریافت از الستیک"
+        last_count = None
+        for match in COUNT_PROGRESS_RE.finditer(log_text):
+            last_count = match
+        if last_count:
+            extra["docs_total"] = int(last_count.group(1))
+            message = f"آماده‌سازی اسکن — {extra['docs_total']} سند"
+            percent = max(percent, 18)
         if "Starting initial scan" in log_text:
             percent, message = 20, "اسکن اولیه الستیک"
         last_scan = None
         for match in SCAN_PROGRESS_RE.finditer(log_text):
             last_scan = match
         if last_scan:
-            label, docs = last_scan.group(1), last_scan.group(2)
+            label = last_scan.group(1)
+            docs = int(last_scan.group(2))
+            total = int(last_scan.group(3)) if last_scan.group(3) else extra.get("docs_total")
+            elapsed_s = int(last_scan.group(4)) if last_scan.group(4) else None
+            extra["docs_done"] = docs
+            extra["scan_label"] = label
+            extra["scan_elapsed_seconds"] = elapsed_s
+            if total:
+                extra["docs_total"] = total
+            total_label = f"{docs}/{total}" if total else str(docs)
             if label == "interaction_scan":
-                percent, message = 38, f"جمع‌آوری تعاملات از الستیک — {docs} سند"
+                if total:
+                    percent = 35 + int(15 * min(1.0, docs / max(1, total)))
+                else:
+                    percent = 38
+                message = f"جمع‌آوری تعاملات از الستیک — {total_label} سند"
             else:
-                percent, message = 25, f"اسکن اولیه الستیک — {docs} سند"
+                if total:
+                    percent = 20 + int(12 * min(1.0, docs / max(1, total)))
+                else:
+                    percent = 25
+                message = f"اسکن اولیه الستیک — {total_label} سند"
         if "Total hits:" in log_text:
             percent, message = max(percent, 32), "جمع‌آوری تعاملات از الستیک"
         if "Starting scan to collect interactions" in log_text:
             percent, message = max(percent, 35), "جمع‌آوری تعاملات از الستیک"
         if "Finished full pipeline." in log_text:
             percent, message = 50, "دریافت الستیک تمام شد"
+            extra.pop("scan_elapsed_seconds", None)
     if "community_detection.py" in log_text:
         percent, stage, message = max(percent, 60), "detect", "در حال تشخیص جوامع"
         last_slot = None
@@ -335,12 +493,50 @@ def infer_live_progress(log_text: str) -> tuple[int, str, str]:
             mode = last_slot.group(3).strip()
             start = (last_slot.group(4) or "").rstrip(".")
             percent = 60 + int(35 * current / total)
+            extra["slots_done"] = current
+            extra["slots_total"] = total
             message = f"تشخیص جوامع: اسلات {current} از {total} ({mode})"
             if start:
                 message += f" — {start}"
         if "[done] Community detection completed." in log_text:
             percent, message = 95, "آماده‌سازی داشبورد"
-    return percent, stage, message
+    extra.update({"percent": percent, "stage": stage, "message": message})
+    return extra
+
+
+def estimate_remaining_seconds(
+    status: str,
+    percent: int,
+    started_at: str | None,
+    finished_at: str | None = None,
+    docs_done: int | None = None,
+    docs_total: int | None = None,
+    scan_label: str = "",
+    scan_elapsed_seconds: int | None = None,
+    slots_done: int | None = None,
+    slots_total: int | None = None,
+) -> tuple[int | None, int | None]:
+    started = parse_utc(started_at)
+    ended = parse_utc(finished_at) or datetime.now(timezone.utc)
+    elapsed = max(0, int((ended - started).total_seconds())) if started else None
+    if status == "done":
+        return 0, elapsed
+    if status not in STOPPABLE_STATUSES:
+        return None, elapsed
+    remaining = None
+    if docs_total and docs_done and (scan_elapsed_seconds or 0) > 0:
+        if scan_label == "interaction_scan":
+            remaining_docs = max(0, docs_total - docs_done)
+        else:
+            remaining_docs = max(0, docs_total - docs_done) + docs_total
+        rate = docs_done / max(1, scan_elapsed_seconds or 0)
+        if rate > 0:
+            remaining = int(remaining_docs / rate)
+    elif slots_total and slots_done and elapsed:
+        remaining = int(elapsed * max(0, slots_total - slots_done) / max(1, slots_done))
+    elif percent > 15 and elapsed and elapsed >= 20:
+        remaining = int(elapsed * (100 - percent) / percent)
+    return remaining, elapsed
 
 
 def command_failure_message(log_file: Path, command: list[str], returncode: int) -> str:
@@ -358,10 +554,17 @@ def command_failure_message(log_file: Path, command: list[str], returncode: int)
     return prefix
 
 
-def read_progress(log_path: str | Path | None, status: str, error: str = "") -> dict[str, Any]:
+def read_progress(
+    log_path: str | Path | None,
+    status: str,
+    error: str = "",
+    started_at: str | None = None,
+    finished_at: str | None = None,
+) -> dict[str, Any]:
     percent = 0
     stage = "queued"
     message = ""
+    extra: dict[str, Any] = {}
     if log_path:
         progress_file = Path(log_path).with_suffix(".progress.json")
         if progress_file.is_file():
@@ -374,19 +577,38 @@ def read_progress(log_path: str | Path | None, status: str, error: str = "") -> 
             except (OSError, TypeError, ValueError, json.JSONDecodeError):
                 pass
         log_file = Path(log_path)
-        if log_file.is_file() and status == "running":
-            try:
-                text = log_file.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                text = ""
-            inferred_percent, inferred_stage, inferred_message = infer_live_progress(text)
+        if log_file.is_file() and status in STOPPABLE_STATUSES:
+            inferred = infer_live_progress(read_text_tail(log_file))
+            inferred_percent = int(inferred.get("percent") or 0)
             if inferred_percent:
                 percent = max(percent, inferred_percent)
-                stage = inferred_stage or stage
-                message = inferred_message or message
+                stage = str(inferred.get("stage") or stage)
+                message = str(inferred.get("message") or message)
+            extra = inferred
     if status == "failed" and error:
         message = error
-    return progress_payload(status, percent, stage, message)
+    remaining_seconds, elapsed_seconds = estimate_remaining_seconds(
+        status,
+        percent,
+        started_at,
+        finished_at,
+        docs_done=extra.get("docs_done"),
+        docs_total=extra.get("docs_total"),
+        scan_label=str(extra.get("scan_label") or ""),
+        scan_elapsed_seconds=extra.get("scan_elapsed_seconds"),
+        slots_done=extra.get("slots_done"),
+        slots_total=extra.get("slots_total"),
+    )
+    return progress_payload(
+        status,
+        percent,
+        stage,
+        message,
+        remaining_seconds=remaining_seconds,
+        elapsed_seconds=elapsed_seconds,
+        docs_done=extra.get("docs_done"),
+        docs_total=extra.get("docs_total"),
+    )
 
 
 def format_slot_token(raw: str) -> str:
@@ -526,6 +748,25 @@ class PipelineStore:
         data.pop("dashboards_json", None)
         return data
 
+    def _with_runtime(
+        self,
+        data: dict[str, Any],
+        log_tail: int = LOG_TAIL_LINES,
+        include_log: bool = True,
+    ) -> dict[str, Any]:
+        log_path = data.get("log_path")
+        if include_log:
+            data["log_tail"] = read_log_tail_lines(log_path, log_tail)
+        data["progress"] = read_progress(
+            log_path,
+            str(data.get("status") or ""),
+            str(data.get("error") or ""),
+            data.get("started_at"),
+            data.get("finished_at"),
+        )
+        data["actions"] = run_actions(str(data.get("status") or ""))
+        return data
+
     def create(self, params: dict[str, Any], log_path: str | Path | None = None) -> dict[str, Any]:
         run_id = uuid.uuid4().hex
         created_at = utc_now()
@@ -576,14 +817,7 @@ class PipelineStore:
         data = self._row(row)
         if not data:
             return None
-        log_path = data.get("log_path")
-        if log_path and Path(log_path).exists():
-            lines = Path(log_path).read_text(encoding="utf-8", errors="replace").splitlines()
-            data["log_tail"] = lines[-log_tail:]
-        else:
-            data["log_tail"] = []
-        data["progress"] = read_progress(log_path, str(data.get("status") or ""), str(data.get("error") or ""))
-        return data
+        return self._with_runtime(data, log_tail=log_tail, include_log=True)
 
     def list(self, limit: int, offset: int) -> tuple[int, list[dict[str, Any]]]:
         with closing(self.connect()) as connection:
@@ -596,7 +830,12 @@ class PipelineStore:
                 """,
                 (limit, offset),
             ).fetchall()
-        return total, [self._row(row) for row in rows if self._row(row)]
+        runs = []
+        for row in rows:
+            data = self._row(row)
+            if data:
+                runs.append(self._with_runtime(data, include_log=False))
+        return total, runs
 
     def mark_running(self, run_id: str, log_path: str | Path | None = None):
         with closing(self.connect()) as connection:
@@ -618,7 +857,7 @@ class PipelineStore:
                 UPDATE pipeline_runs
                 SET status = 'done', finished_at = ?, error = NULL,
                     reports_json = ?, dashboards_json = ?
-                WHERE run_id = ?
+                WHERE run_id = ? AND status IN ('queued', 'running')
                 """,
                 (
                     utc_now(),
@@ -635,7 +874,19 @@ class PipelineStore:
                 """
                 UPDATE pipeline_runs
                 SET status = 'failed', finished_at = ?, error = ?
-                WHERE run_id = ?
+                WHERE run_id = ? AND status IN ('queued', 'running')
+                """,
+                (utc_now(), error[:2000], run_id),
+            )
+            connection.commit()
+
+    def mark_cancelled(self, run_id: str, error: str = "stopped by user"):
+        with closing(self.connect()) as connection:
+            connection.execute(
+                """
+                UPDATE pipeline_runs
+                SET status = 'cancelled', finished_at = ?, error = ?
+                WHERE run_id = ? AND status IN ('queued', 'running')
                 """,
                 (utc_now(), error[:2000], run_id),
             )
@@ -1354,6 +1605,8 @@ def execute_pipeline(
     params: dict[str, Any],
     log_file: Path,
     python_bin: str,
+    cancel_event: threading.Event | None = None,
+    on_process: Callable[[subprocess.Popen[Any] | None], None] | None = None,
 ) -> dict[str, Any]:
     root = Path(root)
     log_file = Path(log_file)
@@ -1374,24 +1627,38 @@ def execute_pipeline(
     if params.get("end_date"):
         env["END_DATE"] = params["end_date"]
 
+    def check_cancel() -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise PipelineCancelled("stopped by user")
+
     def run_cmd(command: list[str]) -> None:
+        check_cancel()
         with log_file.open("a", encoding="utf-8") as handle:
             handle.write(f"\n$ {' '.join(command)}\n")
             handle.flush()
-            process = subprocess.run(
+            process = subprocess.Popen(
                 command,
                 cwd=str(root),
                 env=env,
                 stdout=handle,
                 stderr=subprocess.STDOUT,
-                check=False,
+                start_new_session=True,
             )
-        if process.returncode != 0:
+            if on_process:
+                on_process(process)
+            try:
+                returncode = process.wait()
+            finally:
+                if on_process:
+                    on_process(None)
+        check_cancel()
+        if returncode != 0:
             raise RuntimeError(
-                command_failure_message(log_file, command, process.returncode)
+                command_failure_message(log_file, command, returncode)
             )
 
     write_progress(log_file, 5, "queued", "شروع اجرا")
+    check_cancel()
     if params.get("fetch", True):
         write_progress(log_file, 15, "fetch", "در حال دریافت از الستیک")
         command = [python_bin, "-B", "elastic.py"]
@@ -1438,6 +1705,7 @@ def execute_pipeline(
         config.setdefault("generated_at", datetime.now().isoformat(timespec="seconds"))
         config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
+    check_cancel()
     if params.get("detect", True):
         if not (root / "interactions.json").exists():
             raise RuntimeError("interactions.json is missing; run fetch first or set fetch=true")
@@ -1584,6 +1852,7 @@ def create_app(
     executor = pipeline_executor or execute_pipeline
     pipeline_lock = threading.Lock()
     log_dir = root_path / "runtime_data" / "pipeline_logs"
+    active_jobs: dict[str, dict[str, Any]] = {}
 
     app = FastAPI(
         title="Echo Chamber API",
@@ -1602,22 +1871,69 @@ def create_app(
         max_age=86400,
     )
 
+    def pid_path_for(run_id: str) -> Path:
+        return log_dir / f"{run_id}.pid"
+
+    def remember_process(run_id: str, process: subprocess.Popen[Any] | None) -> None:
+        job = active_jobs.get(run_id)
+        if job is not None:
+            job["process"] = process
+        pid_path = pid_path_for(run_id)
+        if process is None:
+            pid_path.unlink(missing_ok=True)
+            return
+        pid_path.parent.mkdir(parents=True, exist_ok=True)
+        pid_path.write_text(str(process.pid), encoding="utf-8")
+
+    def stop_job_process(run_id: str) -> None:
+        job = active_jobs.get(run_id)
+        process = job.get("process") if job else None
+        if job:
+            job["cancel"].set()
+        terminate_pid(read_pid_file(pid_path_for(run_id)), process)
+
     def run_pipeline_job(run_id: str) -> None:
         run = pipeline_store.get(run_id)
         if not run:
             return
         log_path = Path(run.get("log_path") or (log_dir / f"{run_id}.log"))
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        job = active_jobs.setdefault(run_id, {"cancel": threading.Event(), "process": None})
+        if job["cancel"].is_set():
+            pipeline_store.mark_cancelled(run_id, "stopped by user")
+            active_jobs.pop(run_id, None)
+            return
         pipeline_store.mark_running(run_id, log_path)
         try:
-            artifacts_found = executor(
-                root_path, run.get("params") or {}, log_path, python_bin
-            )
-            pipeline_store.mark_done(run_id, artifacts_found)
+            params = run.get("params") or {}
+            if executor is execute_pipeline:
+                artifacts_found = execute_pipeline(
+                    root_path,
+                    params,
+                    log_path,
+                    python_bin,
+                    cancel_event=job["cancel"],
+                    on_process=lambda process: remember_process(run_id, process),
+                )
+            else:
+                artifacts_found = executor(
+                    root_path, params, log_path, python_bin
+                )
+            if job["cancel"].is_set():
+                pipeline_store.mark_cancelled(run_id, "stopped by user")
+            else:
+                pipeline_store.mark_done(run_id, artifacts_found)
+        except PipelineCancelled:
+            pipeline_store.mark_cancelled(run_id, "stopped by user")
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write("\n[cancelled] stopped by user\n")
         except Exception as exc:
             pipeline_store.mark_failed(run_id, str(exc))
             with log_path.open("a", encoding="utf-8") as handle:
                 handle.write(f"\n[error] {exc}\n")
+        finally:
+            remember_process(run_id, None)
+            active_jobs.pop(run_id, None)
 
     def query_limit_offset(limit: str, offset: str) -> tuple[int, int]:
         return parse_limit_offset({"limit": [str(limit)], "offset": [str(offset)]})
@@ -1628,6 +1944,7 @@ def create_app(
                 return 409, {"error": "a pipeline run is already queued or running"}
             log_dir.mkdir(parents=True, exist_ok=True)
             run = pipeline_store.create(params)
+            active_jobs[run["run_id"]] = {"cancel": threading.Event(), "process": None}
         if pipeline_sync:
             run_pipeline_job(run["run_id"])
         else:
@@ -1640,6 +1957,63 @@ def create_app(
             thread.start()
         started = pipeline_store.get(run["run_id"])
         assert started is not None
+        return 202, started
+
+    def stop_pipeline_run(run_id: str) -> tuple[int, dict[str, Any]]:
+        with pipeline_lock:
+            run = pipeline_store.get(run_id)
+            if not run:
+                return 404, {"error": "not found"}
+            if run["status"] not in STOPPABLE_STATUSES:
+                return 409, {"error": "run is not queued or running"}
+            stop_job_process(run_id)
+            pipeline_store.mark_cancelled(run_id, "stopped by user")
+        stopped = pipeline_store.get(run_id)
+        assert stopped is not None
+        return 200, stopped
+
+    def restart_pipeline_run(run_id: str) -> tuple[int, dict[str, Any]]:
+        run = pipeline_store.get(run_id)
+        if not run:
+            return 404, {"error": "not found"}
+        params = dict(run.get("params") or {})
+        if not params:
+            params = {
+                "fetch": run.get("fetch", True),
+                "detect": run.get("detect", True),
+                "topic_label": run.get("topic_label") or "",
+                "topic_query": run.get("topic_query") or "",
+                "start_date": run.get("start_date"),
+                "end_date": run.get("end_date"),
+                "slot_modes": run.get("slot_modes"),
+            }
+        params = validate_pipeline_payload(params)
+        with pipeline_lock:
+            current = pipeline_store.get(run_id)
+            if not current:
+                return 404, {"error": "not found"}
+            if current["status"] in STOPPABLE_STATUSES:
+                stop_job_process(run_id)
+                pipeline_store.mark_cancelled(run_id, "restarted by user")
+            elif pipeline_store.has_active():
+                return 409, {"error": "a pipeline run is already queued or running"}
+            log_dir.mkdir(parents=True, exist_ok=True)
+            created = pipeline_store.create(params)
+            active_jobs[created["run_id"]] = {"cancel": threading.Event(), "process": None}
+            new_id = created["run_id"]
+        if pipeline_sync:
+            run_pipeline_job(new_id)
+        else:
+            thread = threading.Thread(
+                target=run_pipeline_job,
+                args=(new_id,),
+                name=f"pipeline-{new_id[:8]}",
+                daemon=True,
+            )
+            thread.start()
+        started = pipeline_store.get(new_id)
+        assert started is not None
+        started["restarted_from"] = run_id
         return 202, started
 
     @app.middleware("http")
@@ -1755,6 +2129,22 @@ def create_app(
         status, body = start_pipeline_run(params)
         if status == 409:
             return error_json(409, body["error"])
+        return UTF8JSONResponse(status_code=202, content=body)
+
+    @app.post("/api/v1/pipeline/runs/{run_id}/stop", tags=["pipeline"])
+    def post_pipeline_run_stop(run_id: str):
+        status, body = stop_pipeline_run(run_id)
+        if status != 200:
+            return error_json(status, str(body.get("error") or "cannot stop run"))
+        return body
+
+    @app.post("/api/v1/pipeline/runs/{run_id}/restart", status_code=202, tags=["pipeline"])
+    def post_pipeline_run_restart(run_id: str):
+        status, body = restart_pipeline_run(run_id)
+        if status == 404:
+            return error_json(404, str(body.get("error") or "not found"))
+        if status == 409:
+            return error_json(409, str(body.get("error") or "cannot restart run"))
         return UTF8JSONResponse(status_code=202, content=body)
 
     @app.get("/api/v1/reports", tags=["reports"])
