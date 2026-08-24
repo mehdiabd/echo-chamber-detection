@@ -2281,32 +2281,60 @@ def post_party_change_events(events):
         return False
 
 
-def visualize_or_dummy(slot_start, slot_end, g, louvain=None, hybrid=None, slot_mode=None):
-    """Visualize or use an empty graph if g is empty."""
-    # Format filename for the time slot
+def dashboard_filename_for_slot(slot_start, slot_end, slot_mode=None):
     start_str = format_slot_filename_part(slot_start, slot_mode)
     end_str = format_slot_filename_part(slot_end, slot_mode)
     mode_part = f"{slot_mode}_" if slot_mode else ""
-    filename = f"dashboard_{mode_part}{start_str}_to_{end_str}.html"
-    legend_path = filename.replace(".html", "_legend.json")
+    return f"dashboard_{mode_part}{start_str}_to_{end_str}.html"
 
-    # Drop the previous run's graph JSON so a failed slot never serves it.
-    stale_graph_json = filename.replace("dashboard_", "hybrid_graph_").replace(
+
+def graph_json_path_for_dashboard(dashboard_file):
+    return dashboard_file.replace("dashboard_", "hybrid_graph_").replace(
         ".html", ".json"
     )
+
+
+def load_existing_graph_payload(dashboard_file):
+    path = graph_json_path_for_dashboard(dashboard_file)
     try:
-        os.remove(stale_graph_json)
-    except OSError:
-        pass
-    
-    # Initialize empty partitions if needed
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    nodes = payload.get("nodes") or []
+    if not any(isinstance(item, dict) and item.get("id") for item in nodes):
+        return None
+    return payload
+
+
+def keep_existing_dashboard(slot_start, slot_end, slot_mode=None):
+    filename = dashboard_filename_for_slot(slot_start, slot_end, slot_mode)
+    payload = load_existing_graph_payload(filename)
+    if not payload:
+        return None
+    print(f"[keep] Preserving existing non-empty dashboard {filename}")
+    return filename, payload
+
+
+def visualize_or_dummy(slot_start, slot_end, g, louvain=None, hybrid=None, slot_mode=None):
+    """Visualize a slot graph. Empty graphs never overwrite a populated dashboard."""
+    filename = dashboard_filename_for_slot(slot_start, slot_end, slot_mode)
+    legend_path = filename.replace(".html", "_legend.json")
+    start_str = format_slot_filename_part(slot_start, slot_mode)
+    end_str = format_slot_filename_part(slot_end, slot_mode)
+
     if g.number_of_nodes() == 0:
         print("[warning] Empty graph - skipping community naming")
-        g = nx.Graph()
-        partition_louvain, partition_hybrid = {}, {}
-    else:
-        partition_louvain = louvain if louvain else {}
-        partition_hybrid = hybrid if hybrid else {}
+        kept = keep_existing_dashboard(slot_start, slot_end, slot_mode)
+        if kept:
+            return kept[0]
+        print(f"[skip] Not writing an empty dashboard for {start_str} to {end_str}")
+        return None
+
+    partition_louvain = louvain if louvain else {}
+    partition_hybrid = hybrid if hybrid else {}
 
     legend_data = {
         "hybrid": {"groups": {}},
@@ -2386,12 +2414,10 @@ def visualize_or_dummy(slot_start, slot_end, g, louvain=None, hybrid=None, slot_
         print(f"[error] Visualization failed for {start_str} to {end_str}: {e}")
         import traceback
         traceback.print_exc()
-        
-        with open(filename, 'w', encoding='utf-8') as f:
-            f.write("<html><body>Error generating visualization</body></html>")
-        with open(legend_path, 'w', encoding='utf-8') as f:
-            json.dump(sanitize_json(legend_data), f)
-        return filename
+        if load_existing_graph_payload(filename):
+            print("[keep] Visualization failed; leaving previous dashboard in place")
+            return filename
+        return None
 
 
 # ---- Combined Dashboard Visualization ----
@@ -2532,12 +2558,7 @@ def visualize_combined_dashboard(g, louvain_partition, hybrid_partition, filenam
     net2 = create_community_network()
 
     if g.number_of_nodes() == 0:
-        empty_data = {"hybrid": {"groups": {}}}
-        with open(legend_path, 'w', encoding='utf-8') as f:
-            json.dump(empty_data, f, ensure_ascii=False, indent=2)
-        save_network_html(net2, hybrid_html)
-        save_hybrid_graph_json(g, hybrid_partition, hybrid_html)
-        print(f"[saved] {hybrid_html}, {legend_path}")
+        print("[skip] Combined dashboard not written for empty graph")
         return
 
     # Build only the visual partition shown to users.
@@ -3659,6 +3680,7 @@ if __name__ == "__main__":
                     messages.append(msg)
 
             dashboard_file = None
+            wrote_new_graph = False
             if not messages:
                 print("[skip] No valid messages found in this time slot")
                 dashboard_file = visualize_or_dummy(
@@ -3697,6 +3719,7 @@ if __name__ == "__main__":
                         partition_louvain, partition_hybrid,
                         slot_mode=slot_mode,
                     )
+                    wrote_new_graph = bool(dashboard_file)
                     party_changes = collect_node_party_changes(
                         g_slot,
                         previous_node_parties,
@@ -3707,8 +3730,16 @@ if __name__ == "__main__":
                     post_party_change_events(party_changes)
 
             if dashboard_file:
-                party_focus = build_party_focus_for_messages(messages, meta_map)
-                attach_party_focus_to_graph_json(dashboard_file, party_focus)
+                if wrote_new_graph:
+                    party_focus = build_party_focus_for_messages(messages, meta_map)
+                    attach_party_focus_to_graph_json(dashboard_file, party_focus)
+                else:
+                    existing = load_existing_graph_payload(dashboard_file) or {}
+                    party_focus = (
+                        existing.get("partyFocus")
+                        or existing.get("party_focus")
+                        or {}
+                    )
                 mode_dashboards[slot_mode].append({
                     "file": dashboard_file,
                     "start": format_slot_value(slot_start, slot_mode),
@@ -3717,6 +3748,11 @@ if __name__ == "__main__":
                 })
 
     print("[done] Community detection completed.")
+    if not any(mode_dashboards.values()):
+        raise RuntimeError(
+            "community detection produced no slot dashboards "
+            "(no interactions in range, or all graphs empty)"
+        )
     try:
         generate_timeline_dashboard(
             mode_dashboards=mode_dashboards,

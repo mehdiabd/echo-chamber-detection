@@ -1,6 +1,8 @@
 import json
+import os
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -178,6 +180,46 @@ class CommunityNamingPipelineTests(unittest.TestCase):
             html = output.read_text(encoding="utf-8")
             self.assertIn("جنگ", html)
             self.assertIn("daily", html)
+
+    def test_empty_visualize_does_not_overwrite_populated_graph(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            filename = "dashboard_daily_260101_to_260101.html"
+            graph = root / "hybrid_graph_daily_260101_to_260101.json"
+            graph.write_text(
+                json.dumps(
+                    {
+                        "nodes": [{"id": "alice", "label": "alice"}],
+                        "edges": [],
+                        "partyFocus": {
+                            "parties": [
+                                {
+                                    "name": "اصولگرا",
+                                    "stats": {"total": 1, "outgoing": 1, "incoming": 0},
+                                    "top_interactions": [],
+                                }
+                            ]
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (root / filename).write_text("<html>keep-me</html>", encoding="utf-8")
+            cwd = Path.cwd()
+            try:
+                os.chdir(root)
+                kept = community_detection.visualize_or_dummy(
+                    datetime(2026, 1, 1),
+                    datetime(2026, 1, 1),
+                    nx.Graph(),
+                    slot_mode="daily",
+                )
+            finally:
+                os.chdir(cwd)
+            self.assertEqual(kept, filename)
+            payload = json.loads(graph.read_text(encoding="utf-8"))
+            self.assertEqual(payload["nodes"][0]["id"], "alice")
+            self.assertEqual((root / filename).read_text(encoding="utf-8"), "<html>keep-me</html>")
 
 
 if __name__ == "__main__":
