@@ -3,14 +3,15 @@ import os
 import sys
 import subprocess
 import json
+import time
 from datetime import datetime, timedelta
-from elasticsearch import Elasticsearch
 from elasticsearch.helpers import scan
 from collections import Counter
 import logging
 import re
 from datetime import datetime
 
+from elastic_client import create_es_client
 from elastic_query import (
     DEFAULT_LOOKBACK_DAYS,
     build_topic_clause,
@@ -39,6 +40,39 @@ log.addHandler(console_handler)
 
 def extract_mentions(text):
     return re.findall(r"@(\w+)", text or "")
+
+
+def close_scan(scanner):
+    closer = getattr(scanner, "close", None)
+    if not callable(closer):
+        return
+    try:
+        closer()
+    except Exception:
+        pass
+
+
+def collect_post_mentions(source):
+    entity = source.get("entity")
+    raw_mentions = entity.get("mention", []) if isinstance(entity, dict) else []
+    mentions = []
+    if isinstance(raw_mentions, list):
+        for mention in raw_mentions:
+            handle = normalize_user_handle(mention)
+            if handle:
+                mentions.append(handle)
+    if mentions:
+        return mentions
+    text = first_text_value(
+        source.get("normalized_text"),
+        source.get("text"),
+        source.get("content"),
+    ) or ""
+    return [
+        handle
+        for handle in (normalize_user_handle(item) for item in extract_mentions(text))
+        if handle
+    ]
 
 
 def normalize_tweet_type(value):
@@ -215,48 +249,7 @@ parser.add_argument(
 parser.add_argument("--include-secondary", action="store_true", help="Compatibility flag; secondary metadata is already fetched.")
 parser.add_argument("--max-scan-docs", type=int, default=int(os.getenv("MAX_SCAN_DOCS", "0")))
 args = parser.parse_args()
-auth_type = args.auth
-
-if auth_type == "1":
-    # API Key Authentication
-    # print("You selected Production Elasticsearch server (API Key Authentication).")
-    # Public hostname behind Kong with a publicly trusted certificate, so no local
-    # CA file is needed. Previously https://192.168.59.79:9200 with ca_certs=./ca.crt,
-    # which .gitignore excludes - so the file was never in the image and every run
-    # died with "TlsError: SSLError([Errno 2] No such file or directory)".
-    ELASTICSEARCH_URL = "https://elastic.synappse.ir"
-    AUTH = "YXYyeVRKWUJKSFpwMVdrTnZWRDc6UHhqRHBQa2ZUYW1yMnBwWTV3Ri0xUQ=="
-    INDEX = "twitter_temp_data"
-
-    # Create Elasticsearch client
-    es = Elasticsearch(
-        ELASTICSEARCH_URL,
-        api_key=AUTH,
-        verify_certs=True,
-        ssl_show_warn=False
-    )
-elif auth_type == "2":
-    # Basic Authentication
-    # print("You selected Temp Elasticsearch server (Basic Authentication).")
-    cur_path = os.path.dirname(__file__)
-    CERTIFICATE = os.path.join(cur_path, "http_ca.crt")
-    ELASTICSEARCH_URL = "https://192.168.59.26:9200/"
-    USERNAME = "m.abdolahi"
-    PASSWORD = "@bd0l@h12345"
-    INDEX = "twitter_maroufi"
-
-    # Create Elasticsearch client
-    es = Elasticsearch(
-        ELASTICSEARCH_URL,
-        basic_auth=(USERNAME, PASSWORD),
-        verify_certs=True,
-        ca_certs=CERTIFICATE,
-        ssl_show_warn=False,
-        ssl_assert_hostname=False
-    )
-else:
-    # print("Invalid selection. Please run the script again and select 1 or 2.")
-    sys.exit(1)
+es, INDEX = create_es_client(args.auth)
 
 lookback_days = max(1, args.days)
 start_date, end_date = resolve_date_range(
@@ -368,16 +361,20 @@ def _extract_user(obj):
 def _log_count(label, query):
     try:
         res = es.count(index=INDEX, body={"query": query})
-        log.warning(f"[count] {label}: {res.get('count')}")
+        count = res.get("count")
+        log.warning(f"[count] {label}: {count}")
+        return count
     except Exception as e:
         log.warning(f"[count] {label} failed: {e}")
+        return None
 
 # Diagnostics: check whether data exists in date range and whether query filters too hard
+expected_docs = None
 try:
     date_only_query = {"range": {"date": {"gte": start_date, "lte": end_date, "format": "yyyy-MM-dd"}}}
     _log_count("date_only", date_only_query)
     _log_count("query_only", query_body["query"]["bool"]["must"][0])
-    _log_count("query_and_date", query_body["query"])
+    expected_docs = _log_count("query_and_date", query_body["query"])
     # Index min/max date for alignment
     try:
         min_date = es.search(
@@ -447,7 +444,24 @@ try:
 except Exception as e:
     log.warning(f"[count] diagnostics skipped: {e}")
 
-log.info("Starting initial scan query...")
+scan_total = expected_docs
+if args.max_scan_docs:
+    scan_total = (
+        args.max_scan_docs
+        if not scan_total
+        else min(int(scan_total), int(args.max_scan_docs))
+    )
+
+def _scan_progress(label, docs, started):
+    elapsed_s = max(0, int(time.monotonic() - started))
+    if scan_total:
+        log.warning(
+            f"[scan-progress] {label} docs={docs} total={scan_total} elapsed_s={elapsed_s}"
+        )
+    else:
+        log.warning(f"[scan-progress] {label} docs={docs} elapsed_s={elapsed_s}")
+
+log.warning("Starting initial scan query...")
 primary_scan = scan(
     es,
     index=INDEX,
@@ -459,30 +473,35 @@ primary_scan = scan(
 # Extract all distinct author usernames.
 usernames = set()
 COUNT = 0
-with open("res.json", "w", encoding="utf-8") as f:
-    for doc in primary_scan:
-        source = doc["_source"]
-        raw_type = source.get("type")
-        tweet_type = normalize_tweet_type(raw_type)
-        if tweet_type not in {"post", "reply", "quote", "repost"}:
-            log.warning(f"❓ Unrecognized tweet_type: {tweet_type} (raw={raw_type})")
-        type_counter[tweet_type] += 1
-        json.dump(source, f, ensure_ascii=False)
-        f.write("\n")
-        COUNT += 1
-        if COUNT == 1 or COUNT % 200 == 0:
-            log.info(f"[scan-progress] initial_scan docs={COUNT}")
-        uname = normalize_user_handle(source.get("user_name"))
-        if uname:
-            usernames.add(uname)
-        if args.max_scan_docs and COUNT >= args.max_scan_docs:
-            log.info(f"Reached --max-scan-docs={args.max_scan_docs} in initial scan.")
-            break
-log.info(f"Total hits: {COUNT}")
-log.info(f"TWEET TYPE COUNTS IN SCAN 1: {dict(type_counter)}")
+initial_scan_started = time.monotonic()
+_scan_progress("initial_scan", 0, initial_scan_started)
+try:
+    with open("res.json", "w", encoding="utf-8") as f:
+        for doc in primary_scan:
+            source = doc["_source"]
+            raw_type = source.get("type")
+            tweet_type = normalize_tweet_type(raw_type)
+            if tweet_type not in {"post", "reply", "quote", "repost"}:
+                log.warning(f"❓ Unrecognized tweet_type: {tweet_type} (raw={raw_type})")
+            type_counter[tweet_type] += 1
+            json.dump(source, f, ensure_ascii=False)
+            f.write("\n")
+            COUNT += 1
+            if COUNT == 1 or COUNT % 200 == 0:
+                _scan_progress("initial_scan", COUNT, initial_scan_started)
+            uname = normalize_user_handle(source.get("user_name"))
+            if uname:
+                usernames.add(uname)
+            if args.max_scan_docs and COUNT >= args.max_scan_docs:
+                log.warning(f"Reached --max-scan-docs={args.max_scan_docs} in initial scan.")
+                break
+finally:
+    close_scan(primary_scan)
+log.warning(f"Total hits: {COUNT}")
+log.warning(f"TWEET TYPE COUNTS IN SCAN 1: {dict(type_counter)}")
 
 # Rewind and re-scan to collect interactions
-log.info("Starting scan to collect interactions...")
+log.warning("Starting scan to collect interactions...")
 interaction_scan = scan(
     es,
     index=INDEX,
@@ -491,112 +510,102 @@ interaction_scan = scan(
 )
 
 interaction_usernames = set(usernames)
-with open("interactions.json", "w", encoding="utf-8") as f_interactions:
-    written = 0
-    scanned_docs = 0
-    EXAMPLE_LIMIT = 10
-    EXAMPLE_PRINTED = 0
-    for doc in interaction_scan:
-        scanned_docs += 1
-        if scanned_docs == 1 or scanned_docs % 200 == 0:
-            log.info(f"[scan-progress] interaction_scan docs={scanned_docs}")
-        if args.max_scan_docs and scanned_docs > args.max_scan_docs:
-            log.info(f"Reached --max-scan-docs={args.max_scan_docs} in interaction scan.")
-            break
-        source = doc["_source"]
-        raw_type = source.get("type")
-        tweet_type = normalize_tweet_type(raw_type)
-        # Only warn for truly unrecognized tweet types
-        if tweet_type not in {"post", "reply", "quote", "repost"}:
-            log.warning(f"❓ Unrecognized tweet_type: {tweet_type} (raw={raw_type})")
-        # Remove repetitive example doc logging
-        # Remove repetitive info log for every doc
-        # Remove debug log for every tweet type
-        sender = normalize_user_handle(source.get("user_name"))
-        date_str = source.get("date", "")
+interaction_scan_started = time.monotonic()
+_scan_progress("interaction_scan", 0, interaction_scan_started)
+try:
+    with open("interactions.json", "w", encoding="utf-8") as f_interactions:
+        written = 0
+        scanned_docs = 0
+        EXAMPLE_LIMIT = 10
+        EXAMPLE_PRINTED = 0
+        for doc in interaction_scan:
+            scanned_docs += 1
+            if scanned_docs == 1 or scanned_docs % 200 == 0:
+                _scan_progress("interaction_scan", scanned_docs, interaction_scan_started)
+            if args.max_scan_docs and scanned_docs > args.max_scan_docs:
+                log.info(f"Reached --max-scan-docs={args.max_scan_docs} in interaction scan.")
+                break
+            source = doc["_source"]
+            raw_type = source.get("type")
+            tweet_type = normalize_tweet_type(raw_type)
+            # Only warn for truly unrecognized tweet types
+            if tweet_type not in {"post", "reply", "quote", "repost"}:
+                log.warning(f"❓ Unrecognized tweet_type: {tweet_type} (raw={raw_type})")
+            # Remove repetitive example doc logging
+            # Remove repetitive info log for every doc
+            # Remove debug log for every tweet type
+            sender = normalize_user_handle(source.get("user_name"))
+            date_str = source.get("date", "")
 
-        if not sender or not tweet_type or not date_str:
-            continue
+            if not sender or not tweet_type or not date_str:
+                continue
 
-        # Handle structured interaction types
-        if tweet_type == "reply":
-            target = get_reply_target(source)
-            if not target:
-                # Only warn once for missing target user
-                # log.warning("⛔ Skipped reply: No target user.")
-                continue
-            elif same_user(target, sender):
-                # log.warning("⛔ Skipped reply: Target same as sender.")
-                continue
-            else:
-                interaction = {
-                    "sender": sender,
-                    "target": target,
-                    "type": "reply",
-                    "date": date_str
-                }
-                log.info(f"Writing interaction: {interaction}")
-                json.dump(interaction, f_interactions, ensure_ascii=False)
-                f_interactions.write("\n")
-                interaction_usernames.add(target)
-                written += 1
-        elif tweet_type == "quote":
-            quoted_user = get_quote_target(source)
-            if not quoted_user:
-                # log.warning("⛔ Skipped quote: No quoted user.")
-                continue
-            elif same_user(quoted_user, sender):
-                # log.warning("⛔ Skipped quote: Self-quote.")
-                continue
-            else:
-                interaction = {
-                    "sender": sender,
-                    "target": quoted_user,
-                    "type": "quote",
-                    "date": date_str
-                }
-                log.info(f"Writing interaction: {interaction}")
-                json.dump(interaction, f_interactions, ensure_ascii=False)
-                f_interactions.write("\n")
-                interaction_usernames.add(quoted_user)
-                written += 1
+            # Handle structured interaction types
+            if tweet_type == "reply":
+                target = get_reply_target(source)
+                if not target:
+                    # Only warn once for missing target user
+                    # log.warning("⛔ Skipped reply: No target user.")
+                    continue
+                elif same_user(target, sender):
+                    # log.warning("⛔ Skipped reply: Target same as sender.")
+                    continue
+                else:
+                    interaction = {
+                        "sender": sender,
+                        "target": target,
+                        "type": "reply",
+                        "date": date_str
+                    }
+                    log.info(f"Writing interaction: {interaction}")
+                    json.dump(interaction, f_interactions, ensure_ascii=False)
+                    f_interactions.write("\n")
+                    interaction_usernames.add(target)
+                    written += 1
+            elif tweet_type == "quote":
+                quoted_user = get_quote_target(source)
+                if not quoted_user:
+                    # log.warning("⛔ Skipped quote: No quoted user.")
+                    continue
+                elif same_user(quoted_user, sender):
+                    # log.warning("⛔ Skipped quote: Self-quote.")
+                    continue
+                else:
+                    interaction = {
+                        "sender": sender,
+                        "target": quoted_user,
+                        "type": "quote",
+                        "date": date_str
+                    }
+                    log.info(f"Writing interaction: {interaction}")
+                    json.dump(interaction, f_interactions, ensure_ascii=False)
+                    f_interactions.write("\n")
+                    interaction_usernames.add(quoted_user)
+                    written += 1
 
-        elif tweet_type == "repost":
-            retweeted_user = get_repost_target(source)
-            if not retweeted_user:
-                # log.warning("⛔ Skipped repost: No retweeted user.")
-                continue
-            elif same_user(retweeted_user, sender):
-                # log.warning("⛔ Skipped repost: Self-repost.")
-                continue
-            else:
-                interaction = {
-                    "sender": sender,
-                    "target": retweeted_user,
-                    "type": "repost",
-                    "date": date_str
-                }
-                log.info(f"Writing interaction: {interaction}")
-                json.dump(interaction, f_interactions, ensure_ascii=False)
-                f_interactions.write("\n")
-                interaction_usernames.add(retweeted_user)
-                written += 1
+            elif tweet_type == "repost":
+                retweeted_user = get_repost_target(source)
+                if not retweeted_user:
+                    # log.warning("⛔ Skipped repost: No retweeted user.")
+                    continue
+                elif same_user(retweeted_user, sender):
+                    # log.warning("⛔ Skipped repost: Self-repost.")
+                    continue
+                else:
+                    interaction = {
+                        "sender": sender,
+                        "target": retweeted_user,
+                        "type": "repost",
+                        "date": date_str
+                    }
+                    log.info(f"Writing interaction: {interaction}")
+                    json.dump(interaction, f_interactions, ensure_ascii=False)
+                    f_interactions.write("\n")
+                    interaction_usernames.add(retweeted_user)
+                    written += 1
 
-        elif tweet_type == "post":
-            # log.warning("🟡 Processing a POST tweet...")
-            entity = source.get("entity")
-            mentions = entity.get("mention", []) if isinstance(entity, dict) else []
-            if not mentions:
-                text = (
-                    source.get("normalized_text")
-                    or source.get("text")
-                    or source.get("content")
-                    or ""
-                )
-                mentions = extract_mentions(text)
-                # log.warning(f"🔍 Mentions found after fallback: {mentions}")
-            
-            if mentions:
+            elif tweet_type == "post":
+                mentions = collect_post_mentions(source)
                 for mention in mentions:
                     target = normalize_user_handle(mention)
                     if target and not same_user(target, sender):
@@ -611,49 +620,8 @@ with open("interactions.json", "w", encoding="utf-8") as f_interactions:
                         f_interactions.write("\n")
                         interaction_usernames.add(target)
                         written += 1
-
-            elif tweet_type == "post":
-                # log.warning("🟡 Processing a POST tweet...")
-                mentions = source.get("entity", {}).get("mention", [])
-                normalized_mentions = []
-                if isinstance(mentions, list):
-                    for mention in mentions:
-                        if isinstance(mention, str):
-                            normalized_mentions.append(mention)
-                        elif isinstance(mention, dict):
-                            name = (
-                                mention.get("user_name")
-                                or mention.get("username")
-                                or mention.get("screen_name")
-                                or mention.get("name")
-                            )
-                            if name:
-                                normalized_mentions.append(name)
-                text_blob = source.get("normalized_text") or source.get("content") or ""
-                if normalized_mentions:
-                    mentions = normalized_mentions
-                else:
-                    mentions = extract_mentions(text_blob)
-                    # log.warning(f"🔍 Mentions found after fallback: {mentions}")
-
-                if mentions:
-                    for mention in mentions:
-                        target = mention
-                        if target and target != sender:
-                            interaction = {
-                                "sender": sender,
-                                "target": target,
-                                "type": "mention",
-                                "date": date_str
-                            }
-                            log.info(f"Writing interaction: {interaction}")
-                            json.dump(interaction, f_interactions, ensure_ascii=False)
-                            f_interactions.write("\n")
-                            written += 1
-                else:
-                    # Only warn once for missing mentions
-                    # log.warning("⛔ Skipped post: No mentions found (entity or text).")
-                    continue
+finally:
+    close_scan(interaction_scan)
 
 log.warning(f"✅ TOTAL INTERACTIONS WRITTEN: {written}")
 log.info("Extracted interactions written to interactions.json")

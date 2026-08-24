@@ -1,6 +1,8 @@
 import json
 import tempfile
+import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -241,12 +243,12 @@ class PipelineProgressTests(unittest.TestCase):
             "$ python -B community_detection.py\n"
             "[slot 5/14 | daily] Processing: 2026-01-05 to 2026-01-05...\n"
         )
-        percent, stage, message = infer_live_progress(log_text)
-        self.assertEqual(stage, "detect")
-        self.assertEqual(percent, 72)
-        self.assertIn("5", message)
-        self.assertIn("14", message)
-        self.assertIn("daily", message)
+        inferred = infer_live_progress(log_text)
+        self.assertEqual(inferred["stage"], "detect")
+        self.assertEqual(inferred["percent"], 72)
+        self.assertIn("5", inferred["message"])
+        self.assertIn("14", inferred["message"])
+        self.assertIn("daily", inferred["message"])
 
     def test_read_progress_uses_slot_status_while_running(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -261,6 +263,25 @@ class PipelineProgressTests(unittest.TestCase):
             self.assertEqual(progress["percent"], 77)
             self.assertEqual(progress["steps"][2]["status"], "running")
             self.assertIn("اسلات 2 از 4", progress["message"])
+
+    def test_read_progress_estimates_fetch_remaining_from_scan_rate(self):
+        with tempfile.TemporaryDirectory() as raw:
+            log_file = Path(raw) / "run.log"
+            log_file.write_text(
+                "$ python -B elastic.py --auth 1\n"
+                "[count] query_and_date: 8000\n"
+                "Starting initial scan query...\n"
+                "[scan-progress] initial_scan docs=400 total=8000 elapsed_s=20\n",
+                encoding="utf-8",
+            )
+            started = (datetime.now(timezone.utc) - timedelta(seconds=40)).isoformat()
+            progress = read_progress(log_file, "running", started_at=started)
+            self.assertEqual(progress["stage"], "fetch")
+            self.assertEqual(progress["docs_done"], 400)
+            self.assertEqual(progress["docs_total"], 8000)
+            self.assertEqual(progress["remaining_seconds"], 780)
+            self.assertEqual(progress["remaining_label"], "حدود 13 دقیقه")
+            self.assertIn("400/8000", progress["message"])
 
     def test_command_failure_includes_traceback_line(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -718,6 +739,93 @@ class ApiServerTests(unittest.TestCase):
         self.assertIn("percent", detail["progress"])
         self.assertIn("remaining_percent", detail["progress"])
         self.assertEqual(len(detail["progress"]["steps"]), 4)
+
+    def test_pipeline_list_includes_progress_and_actions(self):
+        created = self.request(
+            "POST",
+            "/api/v1/pipeline/runs",
+            {"fetch": False, "detect": True, "topic_label": "جنگ"},
+            status=202,
+        )
+        listed = self.request("GET", "/api/v1/pipeline/runs")
+        self.assertEqual(listed["total"], 1)
+        run = listed["runs"][0]
+        self.assertEqual(run["run_id"], created["run_id"])
+        self.assertEqual(run["progress"]["percent"], 100)
+        self.assertEqual(run["progress"]["remaining_seconds"], 0)
+        self.assertFalse(run["actions"]["can_stop"])
+        self.assertTrue(run["actions"]["can_restart"])
+
+    def test_stop_running_pipeline_run(self):
+        run = self.pipeline_store.create(
+            {"fetch": False, "detect": True, "topic_label": "جنگ"}
+        )
+        self.pipeline_store.mark_running(run["run_id"])
+        stopped = self.request("POST", f"/api/v1/pipeline/runs/{run['run_id']}/stop")
+        self.assertEqual(stopped["status"], "cancelled")
+        self.assertEqual(stopped["progress"]["message"], "متوقف شد")
+        self.assertFalse(stopped["actions"]["can_stop"])
+        self.assertTrue(stopped["actions"]["can_restart"])
+        self.assertFalse(self.pipeline_store.has_active())
+        blocked = self.request(
+            "POST",
+            f"/api/v1/pipeline/runs/{run['run_id']}/stop",
+            status=409,
+        )
+        self.assertIn("not queued or running", blocked["error"])
+
+    def test_restart_done_pipeline_run(self):
+        created = self.request(
+            "POST",
+            "/api/v1/pipeline/runs",
+            {"fetch": False, "detect": True, "topic_label": "جنگ"},
+            status=202,
+        )
+        restarted = self.request(
+            "POST",
+            f"/api/v1/pipeline/runs/{created['run_id']}/restart",
+            status=202,
+        )
+        self.assertNotEqual(restarted["run_id"], created["run_id"])
+        self.assertEqual(restarted["restarted_from"], created["run_id"])
+        self.assertEqual(len(self.executor_calls), 2)
+        old = self.request("GET", f"/api/v1/pipeline/runs/{created['run_id']}")
+        self.assertEqual(old["status"], "done")
+
+    def test_stop_kills_sleeping_fetch_process(self):
+        (self.root / "elastic.py").write_text(
+            "import time\ntime.sleep(30)\n",
+            encoding="utf-8",
+        )
+        client = create_app(
+            party_store=self.party_store,
+            pipeline_store=self.pipeline_store,
+            review_store=self.review_store,
+            root=self.root,
+            pipeline_sync=False,
+        )
+        http = TestClient(client)
+        created = http.post(
+            "/api/v1/pipeline/runs",
+            json={"fetch": True, "detect": False, "topic_label": "جنگ"},
+        )
+        self.assertEqual(created.status_code, 202)
+        run_id = created.json()["run_id"]
+        status = "queued"
+        for _ in range(40):
+            status = http.get(f"/api/v1/pipeline/runs/{run_id}").json()["status"]
+            if status == "running":
+                break
+            time.sleep(0.05)
+        self.assertEqual(status, "running")
+        stopped = http.post(f"/api/v1/pipeline/runs/{run_id}/stop")
+        self.assertEqual(stopped.status_code, 200)
+        self.assertEqual(stopped.json()["status"], "cancelled")
+        for _ in range(40):
+            if not self.pipeline_store.has_active():
+                break
+            time.sleep(0.05)
+        self.assertFalse(self.pipeline_store.has_active())
 
 
 if __name__ == "__main__":
