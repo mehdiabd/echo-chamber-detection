@@ -192,6 +192,27 @@ class ArtifactIndexTests(unittest.TestCase):
             detail["files"]["graph"],
             "/api/v1/files/hybrid_graph_daily_260101_to_260102.json",
         )
+        total, dashboards = self.index.list_dashboards({}, 10, 0)
+        self.assertEqual(dashboards[0]["topic"], "جنگ")
+
+    def test_empty_graph_json_is_hidden_from_dashboard_list(self):
+        (self.root / "hybrid_graph_daily_260101_to_260102.json").write_text(
+            json.dumps(
+                {
+                    "nodes": [],
+                    "edges": [],
+                    "node_count": 0,
+                    "edge_count": 0,
+                    "partyFocus": {"parties": []},
+                }
+            ),
+            encoding="utf-8",
+        )
+        total, dashboards = self.index.list_dashboards({}, 10, 0)
+        self.assertEqual(total, 0)
+        self.assertEqual(dashboards, [])
+        topics = {item["label"]: item for item in self.index.list_topics()}
+        self.assertFalse(topics["جنگ"]["has_data"])
 
     def test_dashboard_graph_empty_without_json(self):
         (self.root / "hybrid_graph_daily_260101_to_260102.json").unlink()
@@ -302,7 +323,10 @@ class PipelineProgressTests(unittest.TestCase):
     def test_failed_detect_script_surfaces_error_line(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
-            (root / "interactions.json").write_text("[]", encoding="utf-8")
+            (root / "interactions.json").write_text(
+                '{"sender":"a","target":"b","type":"mention","date":"2026-01-01"}\n',
+                encoding="utf-8",
+            )
             (root / "community_detection.py").write_text(
                 "print(\"FileNotFoundError: missing timeline_template.html\")\n"
                 "raise SystemExit(1)\n",
@@ -383,7 +407,9 @@ class ExecutePipelineTests(unittest.TestCase):
             root = Path(raw)
             (root / "elastic.py").write_text(
                 "from pathlib import Path\n"
-                "Path('interactions.json').write_text('[]')\n"
+                "Path('interactions.json').write_text("
+                "'{\\\"sender\\\":\\\"a\\\",\\\"target\\\":\\\"b\\\","
+                "\\\"type\\\":\\\"mention\\\",\\\"date\\\":\\\"2026-01-01\\\"}\\n')\n"
                 "Path('pipeline_config.json').write_text('{\"topic_label\":\"x\"}')\n",
                 encoding="utf-8",
             )
@@ -425,6 +451,33 @@ class ExecutePipelineTests(unittest.TestCase):
             )
             self.assertEqual(progress["percent"], 100)
             self.assertEqual(progress["stage"], "ready")
+
+    def test_empty_fetch_restores_previous_interactions(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            (root / "interactions.json").write_text(
+                '{"sender":"old","target":"kept","type":"reply","date":"2026-01-01"}\n',
+                encoding="utf-8",
+            )
+            (root / "elastic.py").write_text(
+                "from pathlib import Path\nPath('interactions.json').write_text('')\n",
+                encoding="utf-8",
+            )
+            (root / "community_detection.py").write_text(
+                "raise SystemExit('detect should not run')\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(RuntimeError) as raised:
+                execute_pipeline(
+                    root,
+                    {"fetch": True, "detect": True, "topic_label": "جنگ"},
+                    root / "run.log",
+                    "python3",
+                )
+            self.assertIn("no interactions", str(raised.exception))
+            restored = (root / "interactions.json").read_text(encoding="utf-8")
+            self.assertIn('"old"', restored)
+            self.assertFalse((root / "community_detection.py").read_text().startswith("ran"))
 
 
 class ApiServerTests(unittest.TestCase):

@@ -258,7 +258,15 @@ start_date, end_date = resolve_date_range(
     lookback_days=lookback_days,
 )
 range_days = (end_date - start_date).days + 1
-topic_terms = parse_topic_terms(args.topic_query) or DEFAULT_WAR_TOPIC_TERMS
+topic_terms = parse_topic_terms(args.topic_query)
+if not topic_terms or set(topic_terms) <= {
+    DEFAULT_TOPIC_LABEL,
+    str(args.topic_label or "").strip(),
+}:
+    # The UI war topic is a short label. Using it as the only ES clause
+    # returns almost no Jan-2026 hits and then detect used to overwrite
+    # populated dashboards with empty graphs.
+    topic_terms = DEFAULT_WAR_TOPIC_TERMS
 
 query_body = {
     "track_total_hits": True,

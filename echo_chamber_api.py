@@ -12,6 +12,7 @@ import json
 import os
 import random
 import re
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -650,6 +651,33 @@ def load_graph_json(path: Path | None) -> dict[str, Any]:
         "edge_count": len(edges),
         "partyFocus": load_party_focus(payload),
     }
+
+
+def graph_json_has_nodes(path: Path | None) -> bool:
+    if path is None or not Path(path).is_file():
+        return False
+    loaded = load_graph_json(path)
+    return bool(loaded.get("nodes"))
+
+
+def interactions_have_rows(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                text = line.strip()
+                if not text:
+                    continue
+                try:
+                    item = json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(item, dict) and item.get("sender") and item.get("target"):
+                    return True
+    except OSError:
+        return False
+    return False
 
 
 def slot_tokens_from_timeframe(start: str, end: str) -> tuple[str, str] | None:
@@ -1321,8 +1349,13 @@ class ArtifactIndex:
             config,
         ):
             return 0, []
+        topic_label = str(config.get("topic_label") or "")
         items = []
         for item in self.list_dashboards_raw():
+            graph_name = item.get("graph_json")
+            graph_path = self.root / graph_name if graph_name else None
+            if not graph_json_has_nodes(graph_path):
+                continue
             if filters.get("slot_mode") and item["slot_mode"] != filters["slot_mode"]:
                 continue
             start = str(item.get("start") or "")[:10]
@@ -1332,6 +1365,8 @@ class ArtifactIndex:
             if filters.get("end") and end and end > filters["end"]:
                 continue
             public = {key: value for key, value in item.items() if key != "legends"}
+            if topic_label:
+                public["topic"] = topic_label
             items.append(public)
         total = len(items)
         return total, items[offset:offset + limit]
@@ -1400,7 +1435,12 @@ class ArtifactIndex:
             add(item["label"], item["query"], source="preload", preloaded=True)
 
         config = self.pipeline_config().get("config") or {}
-        config_has_data = bool(self.list_dashboards_raw())
+        config_has_data = any(
+            graph_json_has_nodes(
+                self.root / item["graph_json"] if item.get("graph_json") else None
+            )
+            for item in self.list_dashboards_raw()
+        )
         if config.get("topic_label"):
             add(str(config["topic_label"]), source="pipeline_config", has_data=config_has_data)
         for item in config.get("topics") or []:
@@ -1659,8 +1699,12 @@ def execute_pipeline(
 
     write_progress(log_file, 5, "queued", "شروع اجرا")
     check_cancel()
+    interactions_path = root / "interactions.json"
+    interactions_backup = log_file.with_name(f"{log_file.stem}.interactions.bak")
     if params.get("fetch", True):
         write_progress(log_file, 15, "fetch", "در حال دریافت از الستیک")
+        if interactions_have_rows(interactions_path):
+            shutil.copy2(interactions_path, interactions_backup)
         command = [python_bin, "-B", "elastic.py"]
         auth = params.get("auth") or os.getenv("ELASTIC_AUTH") or "1"
         command.extend(["--auth", str(auth)])
@@ -1679,6 +1723,12 @@ def execute_pipeline(
         if params.get("max_scan_docs"):
             command.extend(["--max-scan-docs", str(params["max_scan_docs"])])
         run_cmd(command)
+        if not interactions_have_rows(interactions_path):
+            if interactions_backup.is_file():
+                shutil.copy2(interactions_backup, interactions_path)
+            raise RuntimeError(
+                "elastic fetch returned no interactions; existing dashboards were left unchanged"
+            )
         write_progress(log_file, 50, "fetch", "دریافت الستیک تمام شد")
 
     config_path = root / "pipeline_config.json"
@@ -1707,8 +1757,10 @@ def execute_pipeline(
 
     check_cancel()
     if params.get("detect", True):
-        if not (root / "interactions.json").exists():
-            raise RuntimeError("interactions.json is missing; run fetch first or set fetch=true")
+        if not interactions_have_rows(root / "interactions.json"):
+            raise RuntimeError(
+                "interactions.json is missing or empty; refusing to overwrite dashboards"
+            )
         write_progress(log_file, 60, "detect", "در حال تشخیص جوامع")
         run_cmd([python_bin, "-B", "community_detection.py"])
 
