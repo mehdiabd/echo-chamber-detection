@@ -71,18 +71,18 @@ def write_report(root: Path, name="hybrid_report_2026-01-01_to_2026-01-02_202601
     return path
 
 
-def write_dashboard(root: Path):
-    (root / "dashboard_daily_260101_to_260102.html").write_text(
+def write_dashboard(root: Path, slot_id="daily_260101_to_260102"):
+    (root / f"dashboard_{slot_id}.html").write_text(
         "<html>dashboard</html>", encoding="utf-8"
     )
-    (root / "dashboard_daily_260101_to_260102_legend.json").write_text(
+    (root / f"dashboard_{slot_id}_legend.json").write_text(
         json.dumps({"hybrid": {"groups": {"alice": 0, "bob": 0, "carol": 1}}}),
         encoding="utf-8",
     )
-    (root / "hybrid_graph_daily_260101_to_260102.html").write_text(
+    (root / f"hybrid_graph_{slot_id}.html").write_text(
         "<html>graph</html>", encoding="utf-8"
     )
-    (root / "hybrid_graph_daily_260101_to_260102.json").write_text(
+    (root / f"hybrid_graph_{slot_id}.json").write_text(
         json.dumps(
             {
                 "nodes": [
@@ -750,6 +750,97 @@ class ApiServerTests(unittest.TestCase):
         self.assertIn("تحریم OR sanctions", params["topic_query"])
         self.assertIn("معیشت OR گرانی OR تورم", params["topic_query"])
         self.assertEqual([item["key"] for item in params["topics"]], ["#تحریم", "#معیشت"])
+
+    def prepare_weekly_dashboards(self):
+        # 1405/06/01..19: keep the partial tail from an earlier 13-day run.
+        slots = [
+            "weekly_260823_to_260829",
+            "weekly_260830_to_260904",
+            "weekly_260830_to_260905",
+            "weekly_260906_to_260910",
+        ]
+        for slot_id in slots:
+            write_dashboard(self.root, slot_id)
+        (self.root / "pipeline_config.json").write_text(
+            json.dumps({
+                "topic_label": "جنگ",
+                "start_date": "2026-08-23",
+                "end_date": "2026-09-10",
+                "slot_modes": ["weekly"],
+            }),
+            encoding="utf-8",
+        )
+        return [slots[0], slots[2], slots[3]]
+
+    def test_weekly_dashboard_list_excludes_previous_partial_week(self):
+        expected = self.prepare_weekly_dashboards()
+        for query in (
+            "slot_mode=weekly&start=2026-08-23&end=2026-09-10",
+            "slot_mode=weekly",
+        ):
+            with self.subTest(query=query):
+                result = self.request("GET", f"/api/v1/dashboards?{query}")
+                self.assertEqual(result["total"], 3)
+                self.assertEqual([item["id"] for item in result["dashboards"]], expected)
+        page = self.request(
+            "GET", "/api/v1/dashboards?slot_mode=weekly&limit=1&offset=1"
+        )
+        self.assertEqual(page["total"], 3)
+        self.assertEqual(page["dashboards"][0]["id"], expected[1])
+
+    def test_weekly_search_returns_only_requested_slots(self):
+        expected = self.prepare_weekly_dashboards()
+        result = self.request("POST", "/api/v1/search", {
+            "topics": ["جنگ"], "slot_mode": "weekly",
+            "start": "2026-08-23", "end": "2026-09-10",
+        })
+        self.assertTrue(result["cached"])
+        self.assertEqual(result["total"], 3)
+        self.assertEqual([item["id"] for item in result["dashboards"]], expected)
+        self.assertEqual(self.executor_calls, [])
+
+    def test_weekly_range_uses_request_boundaries_instead_of_config(self):
+        self.prepare_weekly_dashboards()
+        result = self.request(
+            "GET", "/api/v1/dashboards?slot_mode=weekly&start=2026-08-23&end=2026-09-04"
+        )
+        self.assertEqual([item["id"] for item in result["dashboards"]], [
+            "weekly_260823_to_260829", "weekly_260830_to_260904",
+        ])
+
+    def test_weekly_search_recomputes_when_only_partial_week_is_cached(self):
+        expected = self.prepare_weekly_dashboards()
+        for slot_id in expected:
+            (self.root / f"dashboard_{slot_id}.html").unlink()
+        result = self.request("POST", "/api/v1/search", {
+            "topics": ["جنگ"], "slot_mode": "weekly",
+            "start": "2026-08-23", "end": "2026-09-10",
+        }, status=202)
+        self.assertFalse(result["cached"])
+        self.assertEqual(result["dashboards"], [])
+        self.assertEqual(len(self.executor_calls), 1)
+        self.assertEqual(self.executor_calls[0]["slot_modes"], ["weekly"])
+
+    def test_weekly_dashboard_list_rejects_shifted_and_oversized_weeks(self):
+        expected = self.prepare_weekly_dashboards()
+        for slot_id in (
+            "weekly_260824_to_260830",
+            "weekly_260830_to_260910",
+            "weekly_260906_to_260909",
+        ):
+            write_dashboard(self.root, slot_id)
+        result = self.request(
+            "GET", "/api/v1/dashboards?slot_mode=weekly&start=2026-08-23&end=2026-09-10"
+        )
+        self.assertEqual(result["total"], 3)
+        self.assertEqual([item["id"] for item in result["dashboards"]], expected)
+
+    def test_weekly_filter_applies_when_listing_all_modes(self):
+        expected = self.prepare_weekly_dashboards()
+        result = self.request("GET", "/api/v1/dashboards")
+        self.assertEqual([item["id"] for item in result["dashboards"]], [
+            "daily_260101_to_260102", *expected,
+        ])
 
     def test_search_returns_cached_dashboards_or_starts_pipeline(self):
         cached = self.request(

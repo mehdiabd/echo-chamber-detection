@@ -42,6 +42,7 @@ from party_change_api import (
     validate_events,
 )
 from sample_echo_review import _rows_for_method, _sample_balanced
+from time_slots import generate_time_slots
 
 
 DEFAULT_DB_PATH = Path("runtime_data/echo_chamber.sqlite3")
@@ -1350,6 +1351,21 @@ class ArtifactIndex:
         ):
             return 0, []
         topic_label = str(config.get("topic_label") or "")
+        # Files from earlier runs can contain a shorter final week or a
+        # different anchor. Only return boundaries from the selected range.
+        weekly_ranges = None
+        if filters.get("slot_mode") in (None, "", "weekly"):
+            range_start = filters.get("start") or config.get("start_date")
+            range_end = filters.get("end") or config.get("end_date")
+            if range_start and range_end:
+                weekly_ranges = {
+                    (start.date().isoformat(), end.date().isoformat())
+                    for start, end in generate_time_slots(
+                        datetime.strptime(str(range_start)[:10], "%Y-%m-%d"),
+                        datetime.strptime(str(range_end)[:10], "%Y-%m-%d"),
+                        "weekly",
+                    )
+                }
         items = []
         for item in self.list_dashboards_raw():
             graph_name = item.get("graph_json")
@@ -1360,6 +1376,12 @@ class ArtifactIndex:
                 continue
             start = str(item.get("start") or "")[:10]
             end = str(item.get("end") or "")[:10]
+            if (
+                item["slot_mode"] == "weekly"
+                and weekly_ranges is not None
+                and (start, end) not in weekly_ranges
+            ):
+                continue
             if filters.get("start") and start and start < filters["start"]:
                 continue
             if filters.get("end") and end and end > filters["end"]:

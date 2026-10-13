@@ -27,6 +27,7 @@ from community_naming import (
 )
 from elastic_query import DEFAULT_LOOKBACK_DAYS
 from llm_client import call_llm_with_fallback
+from time_slots import generate_time_slots
 
 
 def env_flag(name, default=False):
@@ -165,7 +166,6 @@ def compute_temporal_stability(prev_partition, curr_partition):
         "NMI": normalized_mutual_info_score(prev_labels, curr_labels)
     }
 from datetime import datetime, timedelta
-from dateutil.relativedelta import relativedelta
 from elastic_client import es, INDEX
 
 
@@ -3309,48 +3309,6 @@ def process_visualization(g, louvain_partition, hybrid_partition, filename):
     legend_path = filename.replace(".html", "_legend.json")
     visualize_combined_dashboard(g, louvain_partition, hybrid_partition, filename)
     return hybrid_html, legend_path
-
-
-def generate_time_slots(start_date, end_date, slot_type):
-    slots = []
-    range_start = datetime.combine(start_date.date(), datetime.min.time())
-    range_end = datetime.combine(end_date.date(), datetime.max.time())
-    total_days = inclusive_day_count(range_start, range_end)
-    current = range_start
-
-    if slot_type == "weekly" and 29 <= total_days <= 31:
-        for idx in range(4):
-            if current > range_end:
-                break
-            if idx == 3:
-                slot_end = range_end
-            else:
-                slot_end = min(current + timedelta(days=7) - timedelta(microseconds=1), range_end)
-            slots.append((current, slot_end))
-            current = slot_end + timedelta(microseconds=1)
-        return slots
-
-    while current <= range_end:
-        if slot_type == "hourly":
-            next_slot = current + timedelta(hours=1)
-            slot_end = min(next_slot - timedelta(microseconds=1), range_end)
-        elif slot_type == "daily":
-            next_slot = current + timedelta(days=1)
-            slot_end = min(next_slot - timedelta(microseconds=1), range_end)
-        elif slot_type == "weekly":
-            next_slot = current + timedelta(days=7)
-            slot_end = min(next_slot - timedelta(microseconds=1), range_end)
-        elif slot_type == "monthly":
-            next_slot = current + relativedelta(months=1)
-            slot_end = min(next_slot - timedelta(microseconds=1), range_end)
-        elif slot_type == "quarterly":
-            next_slot = current + relativedelta(months=3)
-            slot_end = min(next_slot - timedelta(microseconds=1), range_end)
-        else:
-            raise ValueError(f"Unsupported slot type: {slot_type}")
-        slots.append((current, slot_end))
-        current = next_slot
-    return slots
 
 
 # --- Timeline Dashboard Generator ---
